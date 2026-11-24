@@ -3,9 +3,9 @@ import {
   AlertCircle,
   AlertTriangle,
   CalendarDays,
+  Camera,
   CheckCircle2,
   Clock,
-  Download,
   FileSpreadsheet,
   LogOut,
   RefreshCw,
@@ -22,6 +22,7 @@ import {
   formatMinutesToHours,
   getCurrentMonthLocalIso,
   getTodayLocalIso,
+  logoutAdmin,
 } from '../api';
 import type {
   AdminAttendanceRow,
@@ -32,16 +33,18 @@ import type {
   PublicConfig,
   TodayDashboardResponse,
 } from '../types';
+import { AdminPhotoCalendarTab } from './AdminPhotoCalendarTab';
 import { AdminSuperAdminsTab } from './AdminSuperAdminsTab';
 import { AdminSuperEmployeesTab } from './AdminSuperEmployeesTab';
 import { AdminSuperSettingsTab } from './AdminSuperSettingsTab';
 import {
-  ProtectedPhotoModal,
+  PhotoAttendanceDetailModal,
   ProtectedPhotoThumbnail,
-  type PhotoModalPayload,
+  clearProtectedPhotoCache,
+  type PhotoDetailModalPayload,
 } from './ProtectedPhoto';
 
-type AdminTab = 'today' | 'monthly' | 'history' | 'employees' | 'admins' | 'settings';
+type AdminTab = 'today' | 'monthly' | 'photos' | 'history' | 'employees' | 'admins' | 'settings';
 
 interface AdminDashboardProps {
   token: string;
@@ -95,9 +98,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   const [error, setError] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
-  const [selectedPhoto, setSelectedPhoto] = useState<PhotoModalPayload | null>(null);
+  const [selectedPhoto, setSelectedPhoto] = useState<PhotoDetailModalPayload | null>(null);
 
   const isSuperAdmin = admin.role === 'super_admin';
+
+  const handleLogoutClick = useCallback(() => {
+    clearProtectedPhotoCache();
+    void logoutAdmin();
+    onLogout();
+  }, [onLogout]);
 
   const loadEmployeeOptions = useCallback(async () => {
     try {
@@ -213,24 +222,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     }
   };
 
-  const handleExportHistoryCsv = async () => {
+  const handleExportHistoryExcel = async () => {
     if (exporting) return;
     setExporting(true);
+    setError(null);
     try {
-      const params = new URLSearchParams({
-        type: 'attendance',
-        from: fromDate,
-        to: toDate,
-        status: historyStatusFilter,
-      });
+      const targetMonth = /^\d{4}-\d{2}/.test(fromDate)
+        ? fromDate.slice(0, 7)
+        : getCurrentMonthLocalIso();
+      const params = new URLSearchParams({ month: targetMonth });
       if (historyEmpFilter) params.set('employeeId', historyEmpFilter);
       await downloadAuthenticatedFile(
-        `/api/admin/export/csv?${params.toString()}`,
+        `/api/admin/export/excel?${params.toString()}`,
         token,
-        `pointage-${fromDate}-au-${toDate}.csv`
+        `Rapport-pointage-${targetMonth}.xlsx`
       );
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Erreur lors de l'export CSV.");
+      setError(err instanceof ApiError ? err.message : "Erreur lors de l'export Excel.");
     } finally {
       setExporting(false);
     }
@@ -239,6 +247,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const navItems: Array<{ id: AdminTab; label: string; icon: React.ReactNode; superOnly?: boolean }> = [
     { id: 'today', label: "Aujourd'hui", icon: <Clock className="w-4 h-4" /> },
     { id: 'monthly', label: 'Bilan mensuel', icon: <FileSpreadsheet className="w-4 h-4" /> },
+    { id: 'photos', label: 'Calendrier photos', icon: <Camera className="w-4 h-4" /> },
     { id: 'history', label: 'Historique', icon: <CalendarDays className="w-4 h-4" /> },
     { id: 'employees', label: 'Employés', icon: <Users className="w-4 h-4" />, superOnly: true },
     { id: 'admins', label: 'Administrateurs', icon: <Shield className="w-4 h-4" />, superOnly: true },
@@ -286,7 +295,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
             <button
               type="button"
-              onClick={onLogout}
+              onClick={handleLogoutClick}
               className="min-h-[40px] inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-100 whitespace-nowrap"
             >
               <LogOut className="w-4 h-4" />
@@ -501,16 +510,28 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                   {emp.has_checkin_photo && (
                                     <ProtectedPhotoThumbnail
                                       token={token}
+                                      photoId={emp.checkin_photo_id}
                                       attendanceId={emp.attendance_id}
                                       kind="checkin"
                                       employeeName={empName}
                                       onOpen={() =>
                                         setSelectedPhoto({
-                                          attendanceId: emp.attendance_id!,
-                                          kind: 'checkin',
                                           employeeName: empName,
+                                          jobTitle: emp.job_title,
+                                          dateIso: todayDate,
                                           dateLabel: formatFrenchDate(todayDate),
-                                          timeLabel: emp.checkin_time ? emp.checkin_time.slice(0, 5) : '',
+                                          attendanceId: emp.attendance_id,
+                                          status: emp.status,
+                                          checkinTime: emp.checkin_time,
+                                          checkoutTime: emp.checkout_time,
+                                          lateMinutes: emp.late_minutes,
+                                          workedMinutes: emp.worked_minutes,
+                                          checkinIp: emp.checkin_ip,
+                                          checkoutIp: emp.checkout_ip,
+                                          checkinPhotoId: emp.checkin_photo_id,
+                                          checkoutPhotoId: emp.checkout_photo_id,
+                                          hasCheckinPhoto: emp.has_checkin_photo,
+                                          hasCheckoutPhoto: emp.has_checkout_photo,
                                         })
                                       }
                                     />
@@ -518,16 +539,28 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                   {emp.has_checkout_photo && (
                                     <ProtectedPhotoThumbnail
                                       token={token}
+                                      photoId={emp.checkout_photo_id}
                                       attendanceId={emp.attendance_id}
                                       kind="checkout"
                                       employeeName={empName}
                                       onOpen={() =>
                                         setSelectedPhoto({
-                                          attendanceId: emp.attendance_id!,
-                                          kind: 'checkout',
                                           employeeName: empName,
+                                          jobTitle: emp.job_title,
+                                          dateIso: todayDate,
                                           dateLabel: formatFrenchDate(todayDate),
-                                          timeLabel: emp.checkout_time ? emp.checkout_time.slice(0, 5) : '',
+                                          attendanceId: emp.attendance_id,
+                                          status: emp.status,
+                                          checkinTime: emp.checkin_time,
+                                          checkoutTime: emp.checkout_time,
+                                          lateMinutes: emp.late_minutes,
+                                          workedMinutes: emp.worked_minutes,
+                                          checkinIp: emp.checkin_ip,
+                                          checkoutIp: emp.checkout_ip,
+                                          checkinPhotoId: emp.checkin_photo_id,
+                                          checkoutPhotoId: emp.checkout_photo_id,
+                                          hasCheckinPhoto: emp.has_checkin_photo,
+                                          hasCheckoutPhoto: emp.has_checkout_photo,
                                         })
                                       }
                                     />
@@ -589,7 +622,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 className="min-h-[40px] inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-4 py-2 text-sm font-bold text-white hover:bg-emerald-800 disabled:opacity-50 whitespace-nowrap"
               >
                 <FileSpreadsheet className="w-4 h-4" />
-                {exporting ? 'Génération Excel...' : 'Exporter Excel (.xlsx)'}
+                {exporting ? 'Génération Excel...' : 'Exporter le rapport Excel'}
               </button>
             </div>
 
@@ -655,6 +688,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </div>
         )}
 
+        {/* TAB: CALENDRIER PHOTOS */}
+        {activeTab === 'photos' && (
+          <AdminPhotoCalendarTab
+            token={token}
+            employeeOptions={employeeOptions}
+            onUnauthorized={handleLogoutClick}
+          />
+        )}
+
         {/* TAB 3: HISTORY & LOGS */}
         {activeTab === 'history' && (
           <div className="space-y-6">
@@ -683,12 +725,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               {historyMode === 'daily' && (
                 <button
                   type="button"
-                  onClick={handleExportHistoryCsv}
+                  onClick={handleExportHistoryExcel}
                   disabled={exporting}
                   className="min-h-[40px] inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-4 py-2 text-sm font-bold text-white hover:bg-emerald-800 disabled:opacity-50 whitespace-nowrap"
                 >
-                  <Download className="w-4 h-4" />
-                  Exporter CSV (Excel)
+                  <FileSpreadsheet className="w-4 h-4" />
+                  {exporting ? 'Génération Excel...' : 'Exporter le rapport Excel'}
                 </button>
               )}
             </div>
@@ -799,45 +841,69 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                               <td className="py-3.5 px-4 text-right font-mono tabular-nums">
                                 {r.worked_minutes > 0 ? formatMinutesToHours(r.worked_minutes) : '-'}
                               </td>
-                              <td className="py-2.5 px-4">
-                                {hasIn || hasOut ? (
-                                  <div className="flex items-center gap-1.5">
-                                    {hasIn && (
-                                      <ProtectedPhotoThumbnail
-                                        token={token}
-                                        attendanceId={r.id}
-                                        kind="checkin"
-                                        employeeName={empName}
-                                        onOpen={() =>
-                                          setSelectedPhoto({
-                                            attendanceId: r.id,
-                                            kind: 'checkin',
-                                            employeeName: empName,
-                                            dateLabel: formatFrenchDate(r.work_date),
-                                            timeLabel: r.checkin_time ? r.checkin_time.slice(0, 5) : '',
-                                          })
-                                        }
-                                      />
-                                    )}
-                                    {hasOut && (
-                                      <ProtectedPhotoThumbnail
-                                        token={token}
-                                        attendanceId={r.id}
-                                        kind="checkout"
-                                        employeeName={empName}
-                                        onOpen={() =>
-                                          setSelectedPhoto({
-                                            attendanceId: r.id,
-                                            kind: 'checkout',
-                                            employeeName: empName,
-                                            dateLabel: formatFrenchDate(r.work_date),
-                                            timeLabel: r.checkout_time ? r.checkout_time.slice(0, 5) : '',
-                                          })
-                                        }
-                                      />
-                                    )}
-                                  </div>
-                                ) : (
+                                <td className="py-2.5 px-4">
+                                  {hasIn || hasOut ? (
+                                    <div className="flex items-center gap-1.5">
+                                      {hasIn && (
+                                        <ProtectedPhotoThumbnail
+                                          token={token}
+                                          photoId={r.checkin_photo_id}
+                                          attendanceId={r.id}
+                                          kind="checkin"
+                                          employeeName={empName}
+                                          onOpen={() =>
+                                            setSelectedPhoto({
+                                              employeeName: empName,
+                                              jobTitle: r.job_title,
+                                              dateIso: r.work_date,
+                                              dateLabel: formatFrenchDate(r.work_date),
+                                              attendanceId: r.id,
+                                              status: r.is_late === 1 ? 'late' : 'present',
+                                              checkinTime: r.checkin_time,
+                                              checkoutTime: r.checkout_time,
+                                              lateMinutes: r.late_minutes,
+                                              workedMinutes: r.worked_minutes,
+                                              checkinIp: r.checkin_ip,
+                                              checkoutIp: r.checkout_ip,
+                                              checkinPhotoId: r.checkin_photo_id,
+                                              checkoutPhotoId: r.checkout_photo_id,
+                                              hasCheckinPhoto: hasIn,
+                                              hasCheckoutPhoto: hasOut,
+                                            })
+                                          }
+                                        />
+                                      )}
+                                      {hasOut && (
+                                        <ProtectedPhotoThumbnail
+                                          token={token}
+                                          photoId={r.checkout_photo_id}
+                                          attendanceId={r.id}
+                                          kind="checkout"
+                                          employeeName={empName}
+                                          onOpen={() =>
+                                            setSelectedPhoto({
+                                              employeeName: empName,
+                                              jobTitle: r.job_title,
+                                              dateIso: r.work_date,
+                                              dateLabel: formatFrenchDate(r.work_date),
+                                              attendanceId: r.id,
+                                              status: r.is_late === 1 ? 'late' : 'present',
+                                              checkinTime: r.checkin_time,
+                                              checkoutTime: r.checkout_time,
+                                              lateMinutes: r.late_minutes,
+                                              workedMinutes: r.worked_minutes,
+                                              checkinIp: r.checkin_ip,
+                                              checkoutIp: r.checkout_ip,
+                                              checkinPhotoId: r.checkin_photo_id,
+                                              checkoutPhotoId: r.checkout_photo_id,
+                                              hasCheckinPhoto: hasIn,
+                                              hasCheckoutPhoto: hasOut,
+                                            })
+                                          }
+                                        />
+                                      )}
+                                    </div>
+                                  ) : (
                                   <span className="text-xs text-slate-400">-</span>
                                 )}
                               </td>
@@ -919,9 +985,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       </div>
 
       {selectedPhoto && (
-        <ProtectedPhotoModal
+        <PhotoAttendanceDetailModal
           token={token}
-          photo={selectedPhoto}
+          detail={selectedPhoto}
           onClose={() => setSelectedPhoto(null)}
         />
       )}

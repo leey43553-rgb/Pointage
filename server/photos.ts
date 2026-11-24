@@ -1,16 +1,31 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { Jimp } from 'jimp';
 import multer from 'multer';
-import { db, getLocalDateString, PHOTOS_DIR } from './db.ts';
+import {
+  APP_ROOT_DIR,
+  db,
+  getLocalDateString,
+  PHOTOS_DIR,
+  type PhotoRow,
+} from './db.ts';
+
+const THUMB_WIDTH_PX = 200;
 
 export const photoUploadMiddleware = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 1024 * 1024, // 1 MB max (client compresses < 150 KB)
+    fileSize: 2 * 1024 * 1024, // 2 MB max (client compresses < 150 KB)
   },
   fileFilter: (_req, file, cb) => {
-    if (['image/jpeg', 'image/jpg', 'image/png', 'image/webp'].includes(file.mimetype)) {
+    const mime = (file.mimetype || '').toLowerCase();
+    // Accept standard image MIME types or generic octet-stream; real magic bytes are verified strictly below
+    if (
+      !mime ||
+      mime.startsWith('image/') ||
+      mime === 'application/octet-stream'
+    ) {
       cb(null, true);
     } else {
       cb(new Error('Format de photo non supporté (JPEG, PNG ou WebP uniquement).'));
@@ -43,12 +58,24 @@ function detectImageExtension(buffer: Buffer): '.jpg' | '.png' | '.webp' | null 
   return null;
 }
 
-export function saveAttendancePhoto(options: {
+async function generateThumbnailBuffer(buffer: Buffer): Promise<Buffer | null> {
+  try {
+    const img = await Jimp.fromBuffer(buffer);
+    if (img.width > THUMB_WIDTH_PX) {
+      img.resize({ w: THUMB_WIDTH_PX });
+    }
+    return await img.getBuffer('image/jpeg', { quality: 75 });
+  } catch {
+    return null;
+  }
+}
+
+export async function saveAttendancePhoto(options: {
   buffer: Buffer;
   workDate: string;
   employeeId: number;
   action: 'checkin' | 'checkout';
-}): string {
+}): Promise<{ filePath: string; thumbPath: string | null }> {
   const ext = detectImageExtension(options.buffer);
   if (!ext) {
     throw new Error('Fichier image invalide.');
@@ -66,43 +93,117 @@ export function saveAttendancePhoto(options: {
 
   fs.mkdirSync(targetDir, { recursive: true });
 
-  const fileName = `${options.action}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}${ext}`;
+  const baseName = `${options.action}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+  const fileName = `${baseName}${ext}`;
   const fullPath = path.resolve(targetDir, fileName);
   if (!fullPath.startsWith(PHOTOS_DIR + path.sep)) {
     throw new Error('Chemin de fichier invalide.');
   }
 
   fs.writeFileSync(fullPath, options.buffer);
-  // Store normalized relative path with forward slashes
-  return `${safeDate}/${employeeFolder}/${fileName}`;
+  const relFilePath = `${safeDate}/${employeeFolder}/${fileName}`;
+
+  let relThumbPath: string | null = null;
+  const thumbBuf = await generateThumbnailBuffer(options.buffer);
+  if (thumbBuf) {
+    const thumbName = `${baseName}_thumb.jpg`;
+    const thumbFullPath = path.resolve(targetDir, thumbName);
+    if (thumbFullPath.startsWith(PHOTOS_DIR + path.sep)) {
+      fs.writeFileSync(thumbFullPath, thumbBuf);
+      relThumbPath = `${safeDate}/${employeeFolder}/${thumbName}`;
+    }
+  }
+
+  return { filePath: relFilePath, thumbPath: relThumbPath };
 }
 
 export function resolveSafePhotoPath(relativePath: string | null): string | null {
   if (!relativePath) return null;
   const normalized = relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
   const resolved = path.resolve(PHOTOS_DIR, normalized);
-  if (!resolved.startsWith(PHOTOS_DIR + path.sep)) {
-    return null;
+  if (resolved.startsWith(PHOTOS_DIR + path.sep) && fs.existsSync(resolved)) {
+    return resolved;
   }
-  if (!fs.existsSync(resolved)) {
-    return null;
+
+  // Fallback for legacy photos saved directly next to app root prior to DATA_DIR migration
+  const legacyBase = path.resolve(APP_ROOT_DIR, 'photos');
+  const legacyResolved = path.resolve(legacyBase, normalized);
+  if (legacyResolved.startsWith(legacyBase + path.sep) && fs.existsSync(legacyResolved)) {
+    return legacyResolved;
   }
-  return resolved;
+
+  return null;
+}
+
+export async function resolveOrCreateThumbnailPath(photo: PhotoRow): Promise<string | null> {
+  if (photo.thumb_path) {
+    const existingThumb = resolveSafePhotoPath(photo.thumb_path);
+    if (existingThumb) return existingThumb;
+  }
+
+  const fullPath = resolveSafePhotoPath(photo.file_path);
+  if (!fullPath) return null;
+
+  try {
+    const fullBuf = fs.readFileSync(fullPath);
+    const thumbBuf = await generateThumbnailBuffer(fullBuf);
+    if (!thumbBuf) {
+      return fullPath;
+    }
+
+    const parsed = path.posix.parse(photo.file_path.replace(/\\/g, '/'));
+    const relThumbPath = `${parsed.dir}/${parsed.name}_thumb.jpg`;
+    const targetThumbPath = path.resolve(PHOTOS_DIR, relThumbPath);
+    if (!targetThumbPath.startsWith(PHOTOS_DIR + path.sep)) {
+      return fullPath;
+    }
+
+    fs.mkdirSync(path.dirname(targetThumbPath), { recursive: true });
+    fs.writeFileSync(targetThumbPath, thumbBuf);
+    db.prepare('UPDATE photos SET thumb_path = ? WHERE id = ?').run(relThumbPath, photo.id);
+    return targetThumbPath;
+  } catch {
+    return fullPath;
+  }
 }
 
 export function cleanupOldPhotos(retentionDays: number): void {
   if (!Number.isFinite(retentionDays) || retentionDays <= 0) return;
-  if (!fs.existsSync(PHOTOS_DIR)) return;
 
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - Math.floor(retentionDays));
   const cutoffDateStr = getLocalDateString(cutoff);
 
-  const oldRows = db
+  const oldPhotoRows = db
+    .prepare('SELECT * FROM photos WHERE work_date < ?')
+    .all(cutoffDateStr) as PhotoRow[];
+
+  for (const p of oldPhotoRows) {
+    const fp = resolveSafePhotoPath(p.file_path);
+    if (fp) {
+      try {
+        fs.unlinkSync(fp);
+      } catch {
+        // ignore
+      }
+    }
+    const tp = resolveSafePhotoPath(p.thumb_path);
+    if (tp) {
+      try {
+        fs.unlinkSync(tp);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  db.prepare('DELETE FROM photos WHERE work_date < ?').run(cutoffDateStr);
+
+  const oldAttRows = db
     .prepare(
       `SELECT id, checkin_photo, checkout_photo
        FROM attendance
-       WHERE work_date < ? AND (checkin_photo IS NOT NULL OR checkout_photo IS NOT NULL)`
+       WHERE work_date < ? AND (checkin_photo IS NOT NULL OR checkout_photo IS NOT NULL OR checkin_photo_id IS NOT NULL OR checkout_photo_id IS NOT NULL)`
     )
     .all(cutoffDateStr) as Array<{
       id: number;
@@ -111,10 +212,10 @@ export function cleanupOldPhotos(retentionDays: number): void {
     }>;
 
   const clearStmt = db.prepare(
-    'UPDATE attendance SET checkin_photo = NULL, checkout_photo = NULL WHERE id = ?'
+    'UPDATE attendance SET checkin_photo = NULL, checkout_photo = NULL, checkin_photo_id = NULL, checkout_photo_id = NULL WHERE id = ?'
   );
 
-  for (const row of oldRows) {
+  for (const row of oldAttRows) {
     const p1 = resolveSafePhotoPath(row.checkin_photo);
     if (p1) {
       try {
@@ -133,6 +234,8 @@ export function cleanupOldPhotos(retentionDays: number): void {
     }
     clearStmt.run(row.id);
   }
+
+  if (!fs.existsSync(PHOTOS_DIR)) return;
 
   // Remove old YYYY-MM-DD folders inside photos/
   try {

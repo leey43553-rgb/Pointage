@@ -3,6 +3,7 @@ import type { NextFunction, Request, Response } from 'express';
 import { APP_CONFIG, db, type AdminRow, type EmployeeRow } from './db.ts';
 
 const TOKEN_SECRET = process.env.SESSION_SECRET || APP_CONFIG.sessionSecret;
+export const ADMIN_COOKIE_NAME = 'pointage_admin_session';
 
 export interface AdminTokenPayload {
   sub: number;
@@ -74,10 +75,55 @@ export function verifyToken(token: string): TokenPayload | null {
   }
 }
 
+function parseCookies(cookieHeader: string | undefined): Record<string, string> {
+  const result: Record<string, string> = {};
+  if (!cookieHeader) return result;
+  for (const part of cookieHeader.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx <= 0) continue;
+    const key = part.slice(0, idx).trim();
+    const val = part.slice(idx + 1).trim();
+    if (key) {
+      try {
+        result[key] = decodeURIComponent(val);
+      } catch {
+        result[key] = val;
+      }
+    }
+  }
+  return result;
+}
+
+export function setAdminSessionCookie(res: Response, token: string): void {
+  res.cookie(ADMIN_COOKIE_NAME, token, {
+    httpOnly: true,
+    sameSite: 'lax',
+    path: '/api',
+    maxAge: 8 * 60 * 60 * 1000,
+  });
+}
+
+export function clearAdminSessionCookie(res: Response): void {
+  res.clearCookie(ADMIN_COOKIE_NAME, {
+    httpOnly: true,
+    sameSite: 'lax',
+    path: '/api',
+  });
+}
+
 function extractBearerToken(req: Request): string | null {
   const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) return null;
-  return header.slice(7).trim();
+  if (header && header.startsWith('Bearer ')) {
+    return header.slice(7).trim();
+  }
+  return null;
+}
+
+function extractAdminToken(req: Request): string | null {
+  const bearer = extractBearerToken(req);
+  if (bearer) return bearer;
+  const cookies = parseCookies(req.headers.cookie);
+  return cookies[ADMIN_COOKIE_NAME] || null;
 }
 
 export function requireEmployee(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
@@ -104,7 +150,7 @@ export function requireEmployee(req: AuthenticatedRequest, res: Response, next: 
 }
 
 export function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
-  const token = extractBearerToken(req);
+  const token = extractAdminToken(req);
   if (!token) {
     res.status(401).json({ error: 'Authentification requise.' });
     return;

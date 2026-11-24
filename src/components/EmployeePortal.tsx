@@ -131,7 +131,11 @@ export const EmployeePortal: React.FC<EmployeePortalProps> = ({
 
       if (photoBlob) {
         const formData = new FormData();
-        formData.append('photo', photoBlob, `${action}.jpg`);
+        const photoFile =
+          photoBlob instanceof File
+            ? photoBlob
+            : new File([photoBlob], `${action}.jpg`, { type: 'image/jpeg' });
+        formData.append('photo', photoFile, `${action}.jpg`);
         data = await apiFormDataRequest<{ attendance: AttendanceRecord; message: string }>(endpoint, {
           method: 'POST',
           formData,

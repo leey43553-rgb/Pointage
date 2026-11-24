@@ -6,9 +6,11 @@ import path from 'node:path';
 import type { NextFunction, Request, Response } from 'express';
 import { Router } from 'express';
 import {
+  clearAdminSessionCookie,
   requireAdmin,
   requireEmployee,
   requireSuperAdmin,
+  setAdminSessionCookie,
   signToken,
   type AuthenticatedRequest,
 } from './auth.ts';
@@ -22,6 +24,7 @@ import {
   type AttendanceRow,
   type EmployeeRow,
   type PhotoRequirement,
+  type PhotoRow,
   type PublicHolidayEntry,
   type SettingsRow,
 } from './db.ts';
@@ -34,6 +37,7 @@ import {
 import {
   cleanupOldPhotos,
   photoUploadMiddleware,
+  resolveOrCreateThumbnailPath,
   resolveSafePhotoPath,
   saveAttendancePhoto,
 } from './photos.ts';
@@ -290,6 +294,8 @@ export function createApiRouter(): Router {
       exp: Date.now() + 8 * 60 * 60 * 1000,
     });
 
+    setAdminSessionCookie(res, token);
+
     res.json({
       token,
       admin: {
@@ -299,6 +305,11 @@ export function createApiRouter(): Router {
         must_change_password: admin.must_change_password === 1,
       },
     });
+  });
+
+  router.post('/auth/logout', (_req: Request, res: Response) => {
+    clearAdminSessionCookie(res);
+    res.json({ ok: true });
   });
 
   // ---------------- EMPLOYEE ROUTES ----------------
@@ -345,7 +356,7 @@ export function createApiRouter(): Router {
     '/attendance/checkin',
     requireEmployee,
     handlePhotoUpload,
-    (req: AuthenticatedRequest, res: Response) => {
+    async (req: AuthenticatedRequest, res: Response) => {
       const emp = req.employeeUser!;
       const settings = getSettings();
       const clientIp = getClientIp(req);
@@ -382,10 +393,10 @@ export function createApiRouter(): Router {
         return;
       }
 
-      let savedPhotoPath: string | null = null;
+      let savedPhoto: { filePath: string; thumbPath: string | null } | null = null;
       if (req.file) {
         try {
-          savedPhotoPath = saveAttendancePhoto({
+          savedPhoto = await saveAttendancePhoto({
             buffer: req.file.buffer,
             workDate: today,
             employeeId: emp.id,
@@ -409,10 +420,35 @@ export function createApiRouter(): Router {
       const fullName = `${emp.first_name} ${emp.last_name}`.trim();
 
       const runTx = db.transaction(() => {
-        db.prepare(
-          `INSERT INTO attendance (employee_id, work_date, checkin_time, checkin_ip, checkin_photo, is_late, late_minutes, worked_minutes, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`
-        ).run(emp.id, today, timeStr, clientIp, savedPhotoPath, isLate, lateMinutes, nowIso);
+        const info = db
+          .prepare(
+            `INSERT INTO attendance (employee_id, work_date, checkin_time, checkin_ip, checkin_photo, is_late, late_minutes, worked_minutes, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`
+          )
+          .run(
+            emp.id,
+            today,
+            timeStr,
+            clientIp,
+            savedPhoto ? savedPhoto.filePath : null,
+            isLate,
+            lateMinutes,
+            nowIso
+          );
+
+        const attId = Number(info.lastInsertRowid);
+        if (savedPhoto) {
+          const pInfo = db
+            .prepare(
+              `INSERT INTO photos (attendance_id, employee_id, kind, work_date, file_path, thumb_path, created_at)
+               VALUES (?, ?, 'checkin', ?, ?, ?, ?)`
+            )
+            .run(attId, emp.id, today, savedPhoto.filePath, savedPhoto.thumbPath, nowIso);
+          db.prepare('UPDATE attendance SET checkin_photo_id = ? WHERE id = ?').run(
+            Number(pInfo.lastInsertRowid),
+            attId
+          );
+        }
 
         db.prepare(
           `INSERT INTO attendance_logs (employee_id, employee_name, action, log_date, log_time, ip_address, created_at)
@@ -437,7 +473,7 @@ export function createApiRouter(): Router {
     '/attendance/checkout',
     requireEmployee,
     handlePhotoUpload,
-    (req: AuthenticatedRequest, res: Response) => {
+    async (req: AuthenticatedRequest, res: Response) => {
       const emp = req.employeeUser!;
       const settings = getSettings();
       const clientIp = getClientIp(req);
@@ -481,10 +517,10 @@ export function createApiRouter(): Router {
         return;
       }
 
-      let savedPhotoPath: string | null = null;
+      let savedPhoto: { filePath: string; thumbPath: string | null } | null = null;
       if (req.file) {
         try {
-          savedPhotoPath = saveAttendancePhoto({
+          savedPhoto = await saveAttendancePhoto({
             buffer: req.file.buffer,
             workDate: today,
             employeeId: emp.id,
@@ -504,11 +540,29 @@ export function createApiRouter(): Router {
       const fullName = `${emp.first_name} ${emp.last_name}`.trim();
 
       const runTx = db.transaction(() => {
+        let photoId: number | null = null;
+        if (savedPhoto) {
+          const pInfo = db
+            .prepare(
+              `INSERT OR REPLACE INTO photos (attendance_id, employee_id, kind, work_date, file_path, thumb_path, created_at)
+               VALUES (?, ?, 'checkout', ?, ?, ?, ?)`
+            )
+            .run(existing.id, emp.id, today, savedPhoto.filePath, savedPhoto.thumbPath, nowIso);
+          photoId = Number(pInfo.lastInsertRowid);
+        }
+
         db.prepare(
           `UPDATE attendance
-           SET checkout_time = ?, checkout_ip = ?, checkout_photo = ?, worked_minutes = ?
+           SET checkout_time = ?, checkout_ip = ?, checkout_photo = ?, checkout_photo_id = ?, worked_minutes = ?
            WHERE id = ?`
-        ).run(timeStr, clientIp, savedPhotoPath, workedMinutes, existing.id);
+        ).run(
+          timeStr,
+          clientIp,
+          savedPhoto ? savedPhoto.filePath : null,
+          photoId,
+          workedMinutes,
+          existing.id
+        );
 
         db.prepare(
           `INSERT INTO attendance_logs (employee_id, employee_name, action, log_date, log_time, ip_address, created_at)
@@ -598,8 +652,10 @@ export function createApiRouter(): Router {
         worked_minutes: att?.worked_minutes || 0,
         checkin_ip: att?.checkin_ip || null,
         checkout_ip: att?.checkout_ip || null,
-        has_checkin_photo: Boolean(att?.checkin_photo),
-        has_checkout_photo: Boolean(att?.checkout_photo),
+        has_checkin_photo: Boolean(att?.checkin_photo || att?.checkin_photo_id),
+        has_checkout_photo: Boolean(att?.checkout_photo || att?.checkout_photo_id),
+        checkin_photo_id: att?.checkin_photo_id || null,
+        checkout_photo_id: att?.checkout_photo_id || null,
       };
     });
 
@@ -723,8 +779,10 @@ export function createApiRouter(): Router {
         a.checkout_time,
         a.checkin_ip,
         a.checkout_ip,
-        CASE WHEN a.checkin_photo IS NOT NULL THEN 1 ELSE 0 END as has_checkin_photo,
-        CASE WHEN a.checkout_photo IS NOT NULL THEN 1 ELSE 0 END as has_checkout_photo,
+        CASE WHEN a.checkin_photo IS NOT NULL OR a.checkin_photo_id IS NOT NULL THEN 1 ELSE 0 END as has_checkin_photo,
+        CASE WHEN a.checkout_photo IS NOT NULL OR a.checkout_photo_id IS NOT NULL THEN 1 ELSE 0 END as has_checkout_photo,
+        a.checkin_photo_id,
+        a.checkout_photo_id,
         a.is_late,
         a.late_minutes,
         a.worked_minutes
@@ -750,37 +808,384 @@ export function createApiRouter(): Router {
     res.json({ from, to, records });
   });
 
-  // Protected admin-only photo endpoint (no public URL)
+  // Protected admin-only photo route by photo ID (/api/photos/:id?thumb=1&download=1)
+  router.get('/photos/:id', requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
+    const photoId = Number(req.params.id);
+    if (!Number.isFinite(photoId)) {
+      res.status(400).json({ error: 'Identifiant photo invalide.' });
+      return;
+    }
+
+    const photo = db.prepare('SELECT * FROM photos WHERE id = ?').get(photoId) as PhotoRow | undefined;
+    if (!photo) {
+      res.status(404).json({ error: 'Photo introuvable.' });
+      return;
+    }
+
+    const wantsThumb = req.query.thumb === '1' || req.query.thumb === 'true';
+    const wantsDownload = req.query.download === '1' || req.query.download === 'true';
+
+    const targetPath = wantsThumb
+      ? await resolveOrCreateThumbnailPath(photo)
+      : resolveSafePhotoPath(photo.file_path);
+
+    if (!targetPath) {
+      res.status(404).json({ error: 'Fichier photo introuvable.' });
+      return;
+    }
+
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    if (wantsDownload) {
+      const ext = path.extname(targetPath) || '.jpg';
+      const label = photo.kind === 'checkin' ? 'arrivee' : 'depart';
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="photo-${label}-${photo.work_date}-emp${photo.employee_id}${ext}"`
+      );
+    }
+    res.sendFile(targetPath);
+  });
+
+  // Protected admin-only photo endpoint by attendance ID + kind (kept for compatibility)
   router.get(
     '/admin/attendance/:id/photo/:kind',
     requireAdmin,
-    (req: AuthenticatedRequest, res: Response) => {
+    async (req: AuthenticatedRequest, res: Response) => {
       const id = Number(req.params.id);
-      const kind = req.params.kind === 'checkout' ? 'checkout' : req.params.kind === 'checkin' ? 'checkin' : null;
+      const kind =
+        req.params.kind === 'checkout' ? 'checkout' : req.params.kind === 'checkin' ? 'checkin' : null;
       if (!Number.isFinite(id) || !kind) {
         res.status(400).json({ error: 'Requête photo invalide.' });
         return;
       }
 
-      const row = db
-        .prepare('SELECT checkin_photo, checkout_photo FROM attendance WHERE id = ?')
-        .get(id) as { checkin_photo: string | null; checkout_photo: string | null } | undefined;
-      if (!row) {
-        res.status(404).json({ error: 'Pointage introuvable.' });
-        return;
+      const photo = db
+        .prepare('SELECT * FROM photos WHERE attendance_id = ? AND kind = ?')
+        .get(id, kind) as PhotoRow | undefined;
+
+      const wantsThumb = req.query.thumb === '1' || req.query.thumb === 'true';
+      const wantsDownload = req.query.download === '1' || req.query.download === 'true';
+
+      let safePath: string | null = null;
+      if (photo) {
+        safePath = wantsThumb
+          ? await resolveOrCreateThumbnailPath(photo)
+          : resolveSafePhotoPath(photo.file_path);
+      } else {
+        const row = db
+          .prepare('SELECT checkin_photo, checkout_photo FROM attendance WHERE id = ?')
+          .get(id) as { checkin_photo: string | null; checkout_photo: string | null } | undefined;
+        if (row) {
+          const relPath = kind === 'checkin' ? row.checkin_photo : row.checkout_photo;
+          safePath = resolveSafePhotoPath(relPath);
+        }
       }
 
-      const relPath = kind === 'checkin' ? row.checkin_photo : row.checkout_photo;
-      const safePath = resolveSafePhotoPath(relPath);
       if (!safePath) {
         res.status(404).json({ error: 'Photo introuvable.' });
         return;
       }
 
       res.setHeader('Cache-Control', 'private, max-age=3600');
+      if (wantsDownload) {
+        const ext = path.extname(safePath) || '.jpg';
+        res.setHeader('Content-Disposition', `attachment; filename="photo-${kind}-${id}${ext}"`);
+      }
       res.sendFile(safePath);
     }
   );
+
+  // Calendar photos endpoint (planning matrix + day view)
+  router.get('/admin/photos/calendar', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
+    const now = new Date();
+    const defaultMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const month =
+      typeof req.query.month === 'string' && /^\d{4}-\d{2}$/.test(req.query.month)
+        ? req.query.month
+        : defaultMonth;
+    const employeeId = req.query.employeeId ? Number(req.query.employeeId) : null;
+
+    const [yearNum, monthNum] = month.split('-').map(Number);
+    const daysInMonth = new Date(yearNum, monthNum, 0).getDate();
+    const todayStr = getLocalDateString();
+    const settings = getSettings();
+    const workingDaysSet = new Set(parseWorkingDays(settings.working_days));
+    const holidays = parsePublicHolidays(settings.public_holidays);
+    const holidayMap = new Map<string, PublicHolidayEntry>(holidays.map((h) => [h.date, h]));
+
+    const officialStartMins = parseTimeToMinutes(settings.official_start_time || '09:00');
+    const cutoffMins = officialStartMins + (settings.grace_minutes || 0);
+    const WEEKDAY_LETTERS = ['D', 'L', 'M', 'M', 'J', 'V', 'S'];
+
+    let empSql = 'SELECT id, first_name, last_name, job_title, is_active FROM employees';
+    const empParams: Array<number> = [];
+    if (employeeId && Number.isFinite(employeeId)) {
+      empSql += ' WHERE id = ?';
+      empParams.push(employeeId);
+    } else {
+      empSql += ' WHERE is_active = 1';
+    }
+    empSql += ' ORDER BY last_name ASC, first_name ASC';
+    const employees = db
+      .prepare(empSql)
+      .all(...empParams) as Array<Omit<EmployeeRow, 'code' | 'created_at'>>;
+
+    const attRows = db
+      .prepare('SELECT * FROM attendance WHERE work_date LIKE ?')
+      .all(`${month}-%`) as AttendanceRow[];
+
+    const attMap = new Map<string, AttendanceRow>();
+    for (const r of attRows) {
+      attMap.set(`${r.employee_id}:${r.work_date}`, r);
+    }
+
+    const days: Array<{
+      day: number;
+      date: string;
+      weekdayIndex: number;
+      weekdayLetter: string;
+      isWeekend: boolean;
+      holidayType: 'holiday' | 'leave' | null;
+      holidayLabel: string;
+      isFuture: boolean;
+    }> = [];
+    for (let day = 1; day <= daysInMonth; day++) {
+      const dateStr = `${yearNum}-${String(monthNum).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      const dow = new Date(yearNum, monthNum - 1, day).getDay();
+      const hol = holidayMap.get(dateStr);
+      days.push({
+        day,
+        date: dateStr,
+        weekdayIndex: dow,
+        weekdayLetter: WEEKDAY_LETTERS[dow] || '',
+        isWeekend: !workingDaysSet.has(dow),
+        holidayType: hol ? hol.type : null,
+        holidayLabel: hol?.label || '',
+        isFuture: dateStr > todayStr,
+      });
+    }
+
+    const employeeRows = employees.map((emp) => {
+      const cells: Record<
+        string,
+        {
+          attendance_id: number | null;
+          status: 'present' | 'late' | 'absent' | 'weekend' | 'holiday' | 'leave' | 'future';
+          checkin_time: string | null;
+          checkout_time: string | null;
+          is_late: boolean;
+          late_minutes: number;
+          worked_minutes: number;
+          checkin_ip: string | null;
+          checkout_ip: string | null;
+          checkin_photo_id: number | null;
+          checkout_photo_id: number | null;
+          holiday_label: string;
+        }
+      > = {};
+
+      for (const d of days) {
+        const att = attMap.get(`${emp.id}:${d.date}`);
+        if (att && att.checkin_time) {
+          const ciMins = parseTimeToMinutes(att.checkin_time);
+          const isLate = ciMins > cutoffMins;
+          const lateMins = isLate ? Math.max(1, ciMins - officialStartMins) : 0;
+          const workedMins = att.checkout_time
+            ? Math.max(0, parseTimeToMinutes(att.checkout_time) - ciMins)
+            : 0;
+
+          cells[d.date] = {
+            attendance_id: att.id,
+            status: isLate ? 'late' : 'present',
+            checkin_time: att.checkin_time,
+            checkout_time: att.checkout_time,
+            is_late: isLate,
+            late_minutes: lateMins,
+            worked_minutes: workedMins,
+            checkin_ip: att.checkin_ip,
+            checkout_ip: att.checkout_ip,
+            checkin_photo_id: att.checkin_photo_id || null,
+            checkout_photo_id: att.checkout_photo_id || null,
+            holiday_label: d.holidayLabel,
+          };
+        } else if (d.holidayType) {
+          cells[d.date] = {
+            attendance_id: null,
+            status: d.holidayType,
+            checkin_time: null,
+            checkout_time: null,
+            is_late: false,
+            late_minutes: 0,
+            worked_minutes: 0,
+            checkin_ip: null,
+            checkout_ip: null,
+            checkin_photo_id: null,
+            checkout_photo_id: null,
+            holiday_label: d.holidayLabel,
+          };
+        } else if (d.isWeekend) {
+          cells[d.date] = {
+            attendance_id: null,
+            status: 'weekend',
+            checkin_time: null,
+            checkout_time: null,
+            is_late: false,
+            late_minutes: 0,
+            worked_minutes: 0,
+            checkin_ip: null,
+            checkout_ip: null,
+            checkin_photo_id: null,
+            checkout_photo_id: null,
+            holiday_label: '',
+          };
+        } else if (d.isFuture) {
+          cells[d.date] = {
+            attendance_id: null,
+            status: 'future',
+            checkin_time: null,
+            checkout_time: null,
+            is_late: false,
+            late_minutes: 0,
+            worked_minutes: 0,
+            checkin_ip: null,
+            checkout_ip: null,
+            checkin_photo_id: null,
+            checkout_photo_id: null,
+            holiday_label: '',
+          };
+        } else {
+          cells[d.date] = {
+            attendance_id: null,
+            status: 'absent',
+            checkin_time: null,
+            checkout_time: null,
+            is_late: false,
+            late_minutes: 0,
+            worked_minutes: 0,
+            checkin_ip: null,
+            checkout_ip: null,
+            checkin_photo_id: null,
+            checkout_photo_id: null,
+            holiday_label: '',
+          };
+        }
+      }
+
+      return {
+        employee_id: emp.id,
+        first_name: emp.first_name,
+        last_name: emp.last_name,
+        job_title: emp.job_title,
+        is_active: emp.is_active === 1,
+        cells,
+      };
+    });
+
+    res.json({
+      month,
+      days,
+      employees: employeeRows,
+    });
+  });
+
+  // Single-day cards endpoint for "Vue par jour"
+  router.get('/admin/photos/day', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
+    const todayStr = getLocalDateString();
+    const dateParam =
+      typeof req.query.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date)
+        ? req.query.date
+        : todayStr;
+    const employeeId = req.query.employeeId ? Number(req.query.employeeId) : null;
+
+    const settings = getSettings();
+    const workingDaysSet = new Set(parseWorkingDays(settings.working_days));
+    const holidays = parsePublicHolidays(settings.public_holidays);
+    const holiday = holidays.find((h) => h.date === dateParam) || null;
+    const [y, m, d] = dateParam.split('-').map(Number);
+    const dow = new Date(y, m - 1, d).getDay();
+    const isWeekend = !workingDaysSet.has(dow);
+    const isFuture = dateParam > todayStr;
+
+    const officialStartMins = parseTimeToMinutes(settings.official_start_time || '09:00');
+    const cutoffMins = officialStartMins + (settings.grace_minutes || 0);
+
+    let empSql = 'SELECT id, first_name, last_name, job_title, is_active FROM employees';
+    const empParams: Array<number> = [];
+    if (employeeId && Number.isFinite(employeeId)) {
+      empSql += ' WHERE id = ?';
+      empParams.push(employeeId);
+    } else {
+      empSql += ' WHERE is_active = 1';
+    }
+    empSql += ' ORDER BY last_name ASC, first_name ASC';
+    const employees = db
+      .prepare(empSql)
+      .all(...empParams) as Array<Omit<EmployeeRow, 'code' | 'created_at'>>;
+
+    const records = db
+      .prepare('SELECT * FROM attendance WHERE work_date = ?')
+      .all(dateParam) as AttendanceRow[];
+    const attByEmp = new Map<number, AttendanceRow>(records.map((r) => [r.employee_id, r]));
+
+    const cards = employees.map((emp) => {
+      const att = attByEmp.get(emp.id);
+      if (att && att.checkin_time) {
+        const ciMins = parseTimeToMinutes(att.checkin_time);
+        const isLate = ciMins > cutoffMins;
+        const lateMins = isLate ? Math.max(1, ciMins - officialStartMins) : 0;
+        const workedMins = att.checkout_time
+          ? Math.max(0, parseTimeToMinutes(att.checkout_time) - ciMins)
+          : 0;
+        return {
+          employee_id: emp.id,
+          first_name: emp.first_name,
+          last_name: emp.last_name,
+          job_title: emp.job_title,
+          attendance_id: att.id,
+          status: isLate ? ('late' as const) : ('present' as const),
+          checkin_time: att.checkin_time,
+          checkout_time: att.checkout_time,
+          is_late: isLate,
+          late_minutes: lateMins,
+          worked_minutes: workedMins,
+          checkin_ip: att.checkin_ip,
+          checkout_ip: att.checkout_ip,
+          checkin_photo_id: att.checkin_photo_id || null,
+          checkout_photo_id: att.checkout_photo_id || null,
+          holiday_label: holiday?.label || '',
+        };
+      }
+
+      const fallbackStatus = holiday
+        ? holiday.type
+        : isWeekend
+        ? ('weekend' as const)
+        : isFuture
+        ? ('future' as const)
+        : ('absent' as const);
+
+      return {
+        employee_id: emp.id,
+        first_name: emp.first_name,
+        last_name: emp.last_name,
+        job_title: emp.job_title,
+        attendance_id: null,
+        status: fallbackStatus,
+        checkin_time: null,
+        checkout_time: null,
+        is_late: false,
+        late_minutes: 0,
+        worked_minutes: 0,
+        checkin_ip: null,
+        checkout_ip: null,
+        checkin_photo_id: null,
+        checkout_photo_id: null,
+        holiday_label: holiday?.label || '',
+      };
+    });
+
+    res.json({ date: dateParam, cards });
+  });
 
   router.get('/admin/logs', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
     const from = typeof req.query.from === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.from)

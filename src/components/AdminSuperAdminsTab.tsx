@@ -104,7 +104,7 @@ export const AdminSuperAdminsTab: React.FC<AdminSuperAdminsTabProps> = ({
       <section className="rounded-2xl bg-white border border-slate-200 p-5 sm:p-6">
         <h2 className="text-lg font-bold text-slate-900">Créer un compte responsable</h2>
         <p className="text-sm text-slate-600 mb-4">
-          Un « Admin » peut consulter les présences et exporter en CSV, mais ne peut ni modifier les paramètres ni gérer les comptes.
+          Un « Admin » peut consulter les présences, le calendrier photos et exporter en Excel (.xlsx), mais ne peut ni modifier les paramètres ni gérer les comptes.
         </p>
 
         <form onSubmit={handleAdd} className="grid grid-cols-1 sm:grid-cols-4 gap-3 items-end">

@@ -67,6 +67,8 @@ export interface TodayEmployeeRow {
   checkout_ip: string | null;
   has_checkin_photo: boolean;
   has_checkout_photo: boolean;
+  checkin_photo_id: number | null;
+  checkout_photo_id: number | null;
 }
 
 export interface TodayDashboardResponse {
@@ -109,9 +111,85 @@ export interface AdminAttendanceRow {
   checkout_ip: string | null;
   has_checkin_photo: number | boolean;
   has_checkout_photo: number | boolean;
+  checkin_photo_id: number | null;
+  checkout_photo_id: number | null;
   is_late: number;
   late_minutes: number;
   worked_minutes: number;
+}
+
+export type CalendarCellStatus =
+  | 'present'
+  | 'late'
+  | 'absent'
+  | 'weekend'
+  | 'holiday'
+  | 'leave'
+  | 'future';
+
+export interface PhotoCalendarDay {
+  day: number;
+  date: string;
+  weekdayIndex: number;
+  weekdayLetter: string;
+  isWeekend: boolean;
+  holidayType: 'holiday' | 'leave' | null;
+  holidayLabel: string;
+  isFuture: boolean;
+}
+
+export interface PhotoCalendarCell {
+  attendance_id: number | null;
+  status: CalendarCellStatus;
+  checkin_time: string | null;
+  checkout_time: string | null;
+  is_late: boolean;
+  late_minutes: number;
+  worked_minutes: number;
+  checkin_ip: string | null;
+  checkout_ip: string | null;
+  checkin_photo_id: number | null;
+  checkout_photo_id: number | null;
+  holiday_label: string;
+}
+
+export interface PhotoCalendarEmployeeRow {
+  employee_id: number;
+  first_name: string;
+  last_name: string;
+  job_title: string;
+  is_active: boolean;
+  cells: Record<string, PhotoCalendarCell>;
+}
+
+export interface PhotoCalendarResponse {
+  month: string;
+  days: PhotoCalendarDay[];
+  employees: PhotoCalendarEmployeeRow[];
+}
+
+export interface PhotoDayCard {
+  employee_id: number;
+  first_name: string;
+  last_name: string;
+  job_title: string;
+  attendance_id: number | null;
+  status: CalendarCellStatus;
+  checkin_time: string | null;
+  checkout_time: string | null;
+  is_late: boolean;
+  late_minutes: number;
+  worked_minutes: number;
+  checkin_ip: string | null;
+  checkout_ip: string | null;
+  checkin_photo_id: number | null;
+  checkout_photo_id: number | null;
+  holiday_label: string;
+}
+
+export interface PhotoDayResponse {
+  date: string;
+  cards: PhotoDayCard[];
 }
 
 export interface AttendanceLogRow {

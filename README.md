@@ -95,7 +95,8 @@ Les scripts suivants (dans `service/` ou `C:\Program Files\Pointage\`) permetten
 
 ## 5. Dépendances principales
 
-- `exceljs` : export mensuel Excel `.xlsx` multi-onglets.
+- `exceljs` : export mensuel Excel `.xlsx` multi-onglets (Résumé du mois + une fiche par employé).
 - `multer` et `@types/multer` : réception sécurisée des photos de présence.
+- `jimp` : génération de miniatures 200px côté serveur pour le calendrier photos.
 - `better-sqlite3`, `bcryptjs`, `vite-plugin-pwa` : SQLite local, hachage des mots de passe et PWA.
 - **WinSW v2.12** et **Inno Setup 6** : exécution en service Windows et création de `Setup.exe`.

@@ -31,6 +31,7 @@ export async function apiRequest<T>(
     response = await fetch(path, {
       method: options.method || 'GET',
       headers,
+      credentials: 'same-origin',
       body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
     });
   } catch {
@@ -77,6 +78,7 @@ export async function apiFormDataRequest<T>(
     response = await fetch(path, {
       method: options.method || 'POST',
       headers,
+      credentials: 'same-origin',
       body: options.formData,
     });
   } catch {
@@ -105,12 +107,24 @@ export async function apiFormDataRequest<T>(
   return data as T;
 }
 
+export async function logoutAdmin(): Promise<void> {
+  try {
+    await fetch('/api/auth/logout', {
+      method: 'POST',
+      credentials: 'same-origin',
+    });
+  } catch {
+    // ignore network failure on logout
+  }
+}
+
 export async function downloadAuthenticatedFile(
   path: string,
   token: string,
   fallbackFilename: string
 ): Promise<void> {
   const response = await fetch(path, {
+    credentials: 'same-origin',
     headers: {
       Authorization: `Bearer ${token}`,
     },

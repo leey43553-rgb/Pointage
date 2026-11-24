@@ -62,9 +62,22 @@ export interface AttendanceRow {
   checkout_ip: string | null;
   checkin_photo: string | null;
   checkout_photo: string | null;
+  checkin_photo_id: number | null;
+  checkout_photo_id: number | null;
   is_late: number;
   late_minutes: number;
   worked_minutes: number;
+  created_at: string;
+}
+
+export interface PhotoRow {
+  id: number;
+  attendance_id: number;
+  employee_id: number;
+  kind: 'checkin' | 'checkout';
+  work_date: string;
+  file_path: string;
+  thumb_path: string | null;
   created_at: string;
 }
 
@@ -215,11 +228,25 @@ export function initDb(): void {
       checkout_ip TEXT,
       checkin_photo TEXT DEFAULT NULL,
       checkout_photo TEXT DEFAULT NULL,
+      checkin_photo_id INTEGER DEFAULT NULL,
+      checkout_photo_id INTEGER DEFAULT NULL,
       is_late INTEGER NOT NULL DEFAULT 0,
       late_minutes INTEGER NOT NULL DEFAULT 0,
       worked_minutes INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       UNIQUE(employee_id, work_date)
+    );
+
+    CREATE TABLE IF NOT EXISTS photos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      attendance_id INTEGER NOT NULL REFERENCES attendance(id) ON DELETE CASCADE,
+      employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('checkin', 'checkout')),
+      work_date TEXT NOT NULL,
+      file_path TEXT NOT NULL,
+      thumb_path TEXT DEFAULT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(attendance_id, kind)
     );
 
     CREATE TABLE IF NOT EXISTS attendance_logs (
@@ -242,6 +269,8 @@ export function initDb(): void {
 
     CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(work_date);
     CREATE INDEX IF NOT EXISTS idx_attendance_employee_date ON attendance(employee_id, work_date);
+    CREATE INDEX IF NOT EXISTS idx_photos_date ON photos(work_date);
+    CREATE INDEX IF NOT EXISTS idx_photos_employee_date ON photos(employee_id, work_date);
     CREATE INDEX IF NOT EXISTS idx_logs_date ON attendance_logs(log_date);
   `);
 
@@ -269,6 +298,73 @@ export function initDb(): void {
   }
   if (!attColNames.has('checkout_photo')) {
     db.exec(`ALTER TABLE attendance ADD COLUMN checkout_photo TEXT DEFAULT NULL`);
+  }
+  if (!attColNames.has('checkin_photo_id')) {
+    db.exec(`ALTER TABLE attendance ADD COLUMN checkin_photo_id INTEGER DEFAULT NULL`);
+  }
+  if (!attColNames.has('checkout_photo_id')) {
+    db.exec(`ALTER TABLE attendance ADD COLUMN checkout_photo_id INTEGER DEFAULT NULL`);
+  }
+
+  // Backfill photos table for any legacy attendance rows that already have file paths
+  const legacyPhotoRows = db
+    .prepare(
+      `SELECT id, employee_id, work_date, checkin_photo, checkout_photo, checkin_photo_id, checkout_photo_id, created_at
+       FROM attendance
+       WHERE (checkin_photo IS NOT NULL AND checkin_photo_id IS NULL)
+          OR (checkout_photo IS NOT NULL AND checkout_photo_id IS NULL)`
+    )
+    .all() as Array<{
+      id: number;
+      employee_id: number;
+      work_date: string;
+      checkin_photo: string | null;
+      checkout_photo: string | null;
+      checkin_photo_id: number | null;
+      checkout_photo_id: number | null;
+      created_at: string;
+    }>;
+
+  if (legacyPhotoRows.length > 0) {
+    const insertPhotoStmt = db.prepare(
+      `INSERT OR IGNORE INTO photos (attendance_id, employee_id, kind, work_date, file_path, thumb_path, created_at)
+       VALUES (?, ?, ?, ?, ?, NULL, ?)`
+    );
+    const getPhotoIdStmt = db.prepare(
+      `SELECT id FROM photos WHERE attendance_id = ? AND kind = ?`
+    );
+    const setInIdStmt = db.prepare(`UPDATE attendance SET checkin_photo_id = ? WHERE id = ?`);
+    const setOutIdStmt = db.prepare(`UPDATE attendance SET checkout_photo_id = ? WHERE id = ?`);
+
+    const runBackfill = db.transaction(() => {
+      for (const row of legacyPhotoRows) {
+        if (row.checkin_photo && !row.checkin_photo_id) {
+          insertPhotoStmt.run(
+            row.id,
+            row.employee_id,
+            'checkin',
+            row.work_date,
+            row.checkin_photo,
+            row.created_at
+          );
+          const p = getPhotoIdStmt.get(row.id, 'checkin') as { id: number } | undefined;
+          if (p) setInIdStmt.run(p.id, row.id);
+        }
+        if (row.checkout_photo && !row.checkout_photo_id) {
+          insertPhotoStmt.run(
+            row.id,
+            row.employee_id,
+            'checkout',
+            row.work_date,
+            row.checkout_photo,
+            row.created_at
+          );
+          const p = getPhotoIdStmt.get(row.id, 'checkout') as { id: number } | undefined;
+          if (p) setOutIdStmt.run(p.id, row.id);
+        }
+      }
+    });
+    runBackfill();
   }
 
   const now = getLocalDateTimeIso();

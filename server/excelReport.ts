@@ -1,6 +1,7 @@
 import ExcelJS from 'exceljs';
 import {
   getLocalDateString,
+  getLocalTimeString,
   type AttendanceRow,
   type EmployeeRow,
   type PublicHolidayEntry,
@@ -37,7 +38,7 @@ export type DailyStatus =
   | 'En retard'
   | 'Absent'
   | 'Week-end'
-  | 'Jour férié'
+  | 'Férié'
   | 'Congé'
   | 'À venir';
 
@@ -55,6 +56,7 @@ export interface DailyReportRow {
   status: DailyStatus;
   hasCheckinPhoto: boolean;
   hasCheckoutPhoto: boolean;
+  observation: string;
 }
 
 export interface MonthlyEmployeeSummary {
@@ -137,6 +139,13 @@ function formatFrenchMonthTitle(month: string): string {
   return `${monthName} ${yStr}`;
 }
 
+function formatMinutesReadable(totalMinutes: number): string {
+  const mins = Math.max(0, Math.round(totalMinutes));
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return `${h}h${String(m).padStart(2, '0')}`;
+}
+
 export function computeMonthlyEmployeeSummaries(
   month: string,
   employees: Array<Pick<EmployeeRow, 'id' | 'first_name' | 'last_name' | 'job_title' | 'is_active'>>,
@@ -217,6 +226,11 @@ export function computeMonthlyEmployeeSummaries(
           missingCheckout = true;
         }
 
+        const obsParts: string[] = [];
+        if (holiday?.label) obsParts.push(holiday.label);
+        if (isLate) obsParts.push(`Retard de ${lateMins} min`);
+        if (missingCheckout) obsParts.push('Départ non pointé (heures non comptées)');
+
         dailyRows.push({
           dateStr,
           displayDate,
@@ -229,8 +243,9 @@ export function computeMonthlyEmployeeSummaries(
           workedMinutes: workedMins,
           lateMinutes: lateMins,
           status: isLate ? 'En retard' : 'Présent',
-          hasCheckinPhoto: Boolean(att.checkin_photo),
-          hasCheckoutPhoto: Boolean(att.checkout_photo),
+          hasCheckinPhoto: Boolean(att.checkin_photo || att.checkin_photo_id),
+          hasCheckoutPhoto: Boolean(att.checkout_photo || att.checkout_photo_id),
+          observation: obsParts.join(' · '),
         });
       } else if (holiday) {
         dailyRows.push({
@@ -244,9 +259,10 @@ export function computeMonthlyEmployeeSummaries(
           missingCheckout: false,
           workedMinutes: null,
           lateMinutes: null,
-          status: holiday.type === 'leave' ? 'Congé' : 'Jour férié',
+          status: holiday.type === 'leave' ? 'Congé' : 'Férié',
           hasCheckinPhoto: false,
           hasCheckoutPhoto: false,
+          observation: holiday.label || (holiday.type === 'leave' ? 'Jour de congé' : 'Jour férié'),
         });
       } else if (!isWorkingDay) {
         dailyRows.push({
@@ -263,6 +279,7 @@ export function computeMonthlyEmployeeSummaries(
           status: 'Week-end',
           hasCheckinPhoto: false,
           hasCheckoutPhoto: false,
+          observation: '',
         });
       } else if (isFutureDay) {
         dailyRows.push({
@@ -279,6 +296,7 @@ export function computeMonthlyEmployeeSummaries(
           status: 'À venir',
           hasCheckinPhoto: false,
           hasCheckoutPhoto: false,
+          observation: '',
         });
       } else {
         daysAbsent++;
@@ -296,6 +314,7 @@ export function computeMonthlyEmployeeSummaries(
           status: 'Absent',
           hasCheckinPhoto: false,
           hasCheckoutPhoto: false,
+          observation: 'Aucun pointage enregistré',
         });
       }
     }
@@ -347,6 +366,13 @@ const THIN_BORDER: Partial<ExcelJS.Borders> = {
   right: { style: 'thin', color: { argb: 'FFCBD5E1' } },
 };
 
+const TOTALS_BORDER: Partial<ExcelJS.Borders> = {
+  top: { style: 'medium', color: { argb: 'FF1E3A8A' } },
+  left: { style: 'thin', color: { argb: 'FF94A3B8' } },
+  bottom: { style: 'medium', color: { argb: 'FF1E3A8A' } },
+  right: { style: 'thin', color: { argb: 'FF94A3B8' } },
+};
+
 const HEADER_FILL: ExcelJS.Fill = {
   type: 'pattern',
   pattern: 'solid',
@@ -356,15 +382,18 @@ const HEADER_FILL: ExcelJS.Fill = {
 const HEADER_FONT: Partial<ExcelJS.Font> = {
   bold: true,
   color: { argb: 'FFFFFFFF' },
-  size: 11,
+  size: 10,
 };
 
-function applyAutoColumnWidths(sheet: ExcelJS.Worksheet, minWidths: number[]): void {
+function applyAutoColumnWidths(
+  sheet: ExcelJS.Worksheet,
+  minWidths: number[],
+  headerRowNumber: number
+): void {
   sheet.columns.forEach((col, index) => {
     let maxLength = minWidths[index] || 12;
     col.eachCell?.({ includeEmpty: false }, (cell, rowNumber) => {
-      // Ignore title banner rows (rows 1-2) when computing table column widths
-      if (rowNumber <= 2) return;
+      if (rowNumber < headerRowNumber) return;
       let text = '';
       if (cell.value instanceof Date) {
         text = '00:00';
@@ -377,7 +406,7 @@ function applyAutoColumnWidths(sheet: ExcelJS.Worksheet, minWidths: number[]): v
         maxLength = text.length;
       }
     });
-    col.width = Math.min(42, maxLength + 4);
+    col.width = Math.min(44, maxLength + 4);
   });
 }
 
@@ -389,39 +418,56 @@ export async function generateMonthlyExcelBuffer(options: {
 }): Promise<Buffer> {
   const { month, summaries, includeSummarySheet, companyName } = options;
   const monthLabel = formatFrenchMonthTitle(month);
+  const now = new Date();
+  const [gy, gm, gd] = getLocalDateString(now).split('-');
+  const generatedLabel = `${gd}/${gm}/${gy} à ${getLocalTimeString(now).slice(0, 5)}`;
 
   const workbook = new ExcelJS.Workbook();
   workbook.creator = companyName || 'Pointage Entreprise';
-  workbook.created = new Date();
+  workbook.created = now;
 
   const usedSheetNames = new Set<string>();
 
-  // ---------------- 1. SUMMARY SHEET ----------------
+  // ---------------- 1. SHEET 1: "Résumé du mois" ----------------
   if (includeSummarySheet) {
-    usedSheetNames.add('résumé');
-    const summarySheet = workbook.addWorksheet('Résumé', {
+    const summarySheetName = 'Résumé du mois';
+    usedSheetNames.add(summarySheetName.toLowerCase());
+    const summaryHeaderRowNum = 5;
+
+    const summarySheet = workbook.addWorksheet(summarySheetName, {
       pageSetup: {
         paperSize: 9, // A4
         orientation: 'landscape',
         fitToPage: true,
         fitToWidth: 1,
         fitToHeight: 0,
+        printTitlesRow: `${summaryHeaderRowNum}:${summaryHeaderRowNum}`,
       },
-      views: [{ state: 'frozen', ySplit: 4 }],
+      views: [{ state: 'frozen', ySplit: summaryHeaderRowNum }],
     });
 
+    summarySheet.mergeCells('A1:J1');
     const titleCell = summarySheet.getCell('A1');
-    titleCell.value = safeExcelText(companyName || 'Mon Entreprise');
-    titleCell.font = { bold: true, size: 16, color: { argb: 'FF1E3A8A' } };
+    titleCell.value = safeExcelText(`${companyName || 'Mon Entreprise'} — Rapport mensuel de présence`);
+    titleCell.font = { bold: true, size: 15, color: { argb: 'FF1E3A8A' } };
+    summarySheet.getRow(1).height = 24;
 
-    const subtitleCell = summarySheet.getCell('A2');
-    subtitleCell.value = `Résumé mensuel de présence — ${monthLabel}`;
-    subtitleCell.font = { bold: true, size: 12, color: { argb: 'FF334155' } };
+    summarySheet.mergeCells('A2:J2');
+    const metaCell = summarySheet.getCell('A2');
+    metaCell.value = `Période : ${monthLabel}   |   Généré le : ${generatedLabel}`;
+    metaCell.font = { bold: true, size: 11, color: { argb: 'FF334155' } };
+    summarySheet.getRow(2).height = 20;
+
+    summarySheet.mergeCells('A3:J3');
+    const subCell = summarySheet.getCell('A3');
+    subCell.value = `Effectif inclus : ${summaries.length} employé${summaries.length > 1 ? 's' : ''}`;
+    subCell.font = { italic: true, size: 10, color: { argb: 'FF64748B' } };
 
     const headers = [
       'Nom',
+      'Prénom',
       'Poste',
-      'Jours travaillés attendus',
+      'Jours ouvrables',
       'Jours présents',
       "Jours d'absence",
       'Nombre de retards',
@@ -430,8 +476,8 @@ export async function generateMonthlyExcelBuffer(options: {
       'Taux de présence (%)',
     ];
 
-    const headerRow = summarySheet.getRow(4);
-    headerRow.height = 28;
+    const headerRow = summarySheet.getRow(summaryHeaderRowNum);
+    headerRow.height = 30;
     headers.forEach((h, i) => {
       const cell = headerRow.getCell(i + 1);
       cell.value = h;
@@ -440,18 +486,33 @@ export async function generateMonthlyExcelBuffer(options: {
       cell.border = THIN_BORDER;
       cell.alignment = {
         vertical: 'middle',
-        horizontal: i <= 1 ? 'left' : 'center',
+        horizontal: i <= 2 ? 'left' : 'center',
         wrapText: true,
       };
     });
 
+    let sumExpected = 0;
+    let sumPresent = 0;
+    let sumAbsent = 0;
+    let sumLateCount = 0;
+    let sumLateMins = 0;
+    let sumWorkedMins = 0;
+
     summaries.forEach((emp, idx) => {
-      const rowNum = 5 + idx;
+      const rowNum = summaryHeaderRowNum + 1 + idx;
       const row = summarySheet.getRow(rowNum);
       row.height = 22;
 
+      sumExpected += emp.expected_working_days;
+      sumPresent += emp.days_present;
+      sumAbsent += emp.days_absent;
+      sumLateCount += emp.days_late;
+      sumLateMins += emp.total_late_minutes;
+      sumWorkedMins += emp.total_worked_minutes;
+
       const values: Array<string | number> = [
-        safeExcelText(`${emp.first_name} ${emp.last_name}`),
+        safeExcelText(emp.last_name),
+        safeExcelText(emp.first_name),
         safeExcelText(emp.job_title || '-'),
         emp.expected_working_days,
         emp.days_present,
@@ -466,29 +527,83 @@ export async function generateMonthlyExcelBuffer(options: {
         const cell = row.getCell(colIdx + 1);
         cell.value = val;
         cell.border = THIN_BORDER;
-        cell.font = { size: 10, color: { argb: 'FF0F172A' }, bold: colIdx === 0 };
+        cell.font = {
+          size: 10,
+          color: {
+            argb:
+              colIdx === 5 && emp.days_absent > 0
+                ? 'FF991B1B'
+                : colIdx === 6 && emp.days_late > 0
+                ? 'FF9A3412'
+                : 'FF0F172A',
+          },
+          bold: colIdx <= 1 || (colIdx === 5 && emp.days_absent > 0),
+        };
         cell.alignment = {
           vertical: 'middle',
-          horizontal: colIdx <= 1 ? 'left' : 'center',
+          horizontal: colIdx <= 2 ? 'left' : 'center',
         };
         if (idx % 2 === 1) {
           cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
         }
-        if (colIdx === 6 || colIdx === 7) {
+        if (colIdx === 7 || colIdx === 8) {
           cell.numFmt = '[h]:mm';
         }
-        if (colIdx === 8) {
+        if (colIdx === 9) {
           cell.numFmt = '0.0%';
         }
       });
     });
 
-    applyAutoColumnWidths(summarySheet, [22, 18, 22, 16, 16, 18, 20, 22, 20]);
+    // Totals row at bottom of Résumé du mois
+    const totalRowNum = summaryHeaderRowNum + 1 + summaries.length;
+    const totalRow = summarySheet.getRow(totalRowNum);
+    totalRow.height = 26;
+
+    const overallRate = sumExpected > 0 ? sumPresent / sumExpected : 0;
+    const summaryTotals: Array<string | number> = [
+      'TOTAUX',
+      `${summaries.length} employé(s)`,
+      '-',
+      sumExpected,
+      sumPresent,
+      sumAbsent,
+      sumLateCount,
+      sumLateMins / 1440,
+      sumWorkedMins / 1440,
+      overallRate,
+    ];
+
+    summaryTotals.forEach((val, colIdx) => {
+      const cell = totalRow.getCell(colIdx + 1);
+      cell.value = val;
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE2E8F0' } };
+      cell.font = { bold: true, size: 10, color: { argb: 'FF0F172A' } };
+      cell.border = TOTALS_BORDER;
+      cell.alignment = {
+        vertical: 'middle',
+        horizontal: colIdx <= 2 ? 'left' : 'center',
+      };
+      if (colIdx === 7 || colIdx === 8) {
+        cell.numFmt = '[h]:mm';
+      }
+      if (colIdx === 9) {
+        cell.numFmt = '0.0%';
+      }
+    });
+
+    applyAutoColumnWidths(
+      summarySheet,
+      [18, 16, 18, 16, 15, 16, 17, 20, 22, 18],
+      summaryHeaderRowNum
+    );
   }
 
-  // ---------------- 2. PER-EMPLOYEE SHEETS ----------------
+  // ---------------- 2. ONE SHEET PER EMPLOYEE ----------------
   for (const emp of summaries) {
     const sheetTitle = sanitizeSheetName(`${emp.first_name} ${emp.last_name}`, usedSheetNames);
+    const empHeaderRowNum = 6;
+
     const sheet = workbook.addWorksheet(sheetTitle, {
       pageSetup: {
         paperSize: 9, // A4
@@ -496,19 +611,42 @@ export async function generateMonthlyExcelBuffer(options: {
         fitToPage: true,
         fitToWidth: 1,
         fitToHeight: 0,
+        printTitlesRow: `${empHeaderRowNum}:${empHeaderRowNum}`,
       },
-      views: [{ state: 'frozen', ySplit: 4 }],
+      views: [{ state: 'frozen', ySplit: empHeaderRowNum }],
     });
 
+    // Header block (rows 1..4)
+    sheet.mergeCells('A1:J1');
     const empTitle = sheet.getCell('A1');
-    empTitle.value = safeExcelText(`${emp.first_name} ${emp.last_name}`);
-    empTitle.font = { bold: true, size: 16, color: { argb: 'FF1E3A8A' } };
+    empTitle.value = safeExcelText(`${emp.last_name.toUpperCase()} ${emp.first_name} — Fiche mensuelle de pointage`);
+    empTitle.font = { bold: true, size: 14, color: { argb: 'FF1E3A8A' } };
+    sheet.getRow(1).height = 22;
 
+    sheet.mergeCells('A2:J2');
     const empMeta = sheet.getCell('A2');
     empMeta.value = safeExcelText(
-      `Poste : ${emp.job_title || 'Non renseigné'}  |  Mois : ${monthLabel}  |  Entreprise : ${companyName}`
+      `Entreprise : ${companyName || 'Mon Entreprise'}   |   Poste : ${emp.job_title || 'Non renseigné'}   |   Mois : ${monthLabel}   |   Généré le : ${generatedLabel}`
     );
-    empMeta.font = { bold: true, size: 11, color: { argb: 'FF334155' } };
+    empMeta.font = { bold: true, size: 10, color: { argb: 'FF334155' } };
+    sheet.getRow(2).height = 18;
+
+    // Small summary bar in rows 3-4
+    sheet.mergeCells('A3:J3');
+    const summaryLine = sheet.getCell('A3');
+    summaryLine.value =
+      `Résumé : Jours présents : ${emp.days_present} / ${emp.expected_working_days}   ·   ` +
+      `Absences : ${emp.days_absent}   ·   ` +
+      `Retards : ${emp.days_late} (${formatMinutesReadable(emp.total_late_minutes)})   ·   ` +
+      `Total heures : ${formatMinutesReadable(emp.total_worked_minutes)}   ·   ` +
+      `Taux : ${emp.attendance_rate}%`;
+    summaryLine.font = { bold: true, size: 10, color: { argb: 'FF0F172A' } };
+    summaryLine.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF1F5F9' } };
+    summaryLine.border = THIN_BORDER;
+    summaryLine.alignment = { vertical: 'middle', horizontal: 'left' };
+    sheet.getRow(3).height = 22;
+
+    sheet.getRow(4).height = 8;
 
     const dayHeaders = [
       'Date',
@@ -520,10 +658,11 @@ export async function generateMonthlyExcelBuffer(options: {
       'Statut',
       'Photo arrivée',
       'Photo départ',
+      'Observation',
     ];
 
-    const headerRow = sheet.getRow(4);
-    headerRow.height = 26;
+    const headerRow = sheet.getRow(empHeaderRowNum);
+    headerRow.height = 28;
     dayHeaders.forEach((h, i) => {
       const cell = headerRow.getCell(i + 1);
       cell.value = h;
@@ -532,17 +671,18 @@ export async function generateMonthlyExcelBuffer(options: {
       cell.border = THIN_BORDER;
       cell.alignment = {
         vertical: 'middle',
-        horizontal: i <= 1 ? 'left' : 'center',
+        horizontal: i <= 1 || i === 9 ? 'left' : 'center',
+        wrapText: true,
       };
     });
 
     emp.daily_rows.forEach((d, idx) => {
-      const rowNum = 5 + idx;
+      const rowNum = empHeaderRowNum + 1 + idx;
       const row = sheet.getRow(rowNum);
       row.height = 20;
 
-      // Determine row fill & status color
-      let rowFillArgb: string | null = null;
+      // Row fill & status color
+      let rowFillArgb: string | null = idx % 2 === 1 ? 'FFF8FAFC' : null; // alternating row color
       let statusFontColor = 'FF0F172A';
       if (d.status === 'Absent') {
         rowFillArgb = 'FFFEE2E2'; // light red
@@ -550,9 +690,12 @@ export async function generateMonthlyExcelBuffer(options: {
       } else if (d.status === 'En retard') {
         rowFillArgb = 'FFFFEDD5'; // light orange
         statusFontColor = 'FF9A3412';
-      } else if (d.status === 'Week-end' || d.status === 'Jour férié' || d.status === 'Congé') {
-        rowFillArgb = 'FFF1F5F9'; // light grey
+      } else if (d.status === 'Week-end') {
+        rowFillArgb = 'FFE2E8F0'; // light grey
         statusFontColor = 'FF475569';
+      } else if (d.status === 'Férié' || d.status === 'Congé') {
+        rowFillArgb = 'FFEDF2F7';
+        statusFontColor = 'FF1E3A8A';
       } else if (d.status === 'Présent') {
         statusFontColor = 'FF166534';
       }
@@ -607,12 +750,15 @@ export async function generateMonthlyExcelBuffer(options: {
       const cPhotoOut = row.getCell(9);
       cPhotoOut.value = d.hasCheckoutPhoto ? 'Oui' : 'Non';
 
-      for (let colIdx = 1; colIdx <= 9; colIdx++) {
+      const cObs = row.getCell(10);
+      cObs.value = d.observation ? safeExcelText(d.observation) : '-';
+
+      for (let colIdx = 1; colIdx <= 10; colIdx++) {
         const cell = row.getCell(colIdx);
         cell.border = THIN_BORDER;
         cell.alignment = {
           vertical: 'middle',
-          horizontal: colIdx <= 2 ? 'left' : 'center',
+          horizontal: colIdx <= 2 || colIdx === 10 ? 'left' : 'center',
         };
         if (rowFillArgb) {
           cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: rowFillArgb } };
@@ -625,7 +771,7 @@ export async function generateMonthlyExcelBuffer(options: {
                 ? statusFontColor
                 : colIdx === 4 && d.missingCheckout
                 ? 'FFB45309'
-                : rowFillArgb === 'FFF1F5F9'
+                : d.status === 'Week-end'
                 ? 'FF475569'
                 : 'FF0F172A',
           },
@@ -635,7 +781,7 @@ export async function generateMonthlyExcelBuffer(options: {
     });
 
     // Totals row at bottom
-    const totalRowNum = 5 + emp.daily_rows.length;
+    const totalRowNum = empHeaderRowNum + 1 + emp.daily_rows.length;
     const totalRow = sheet.getRow(totalRowNum);
     totalRow.height = 26;
 
@@ -644,14 +790,15 @@ export async function generateMonthlyExcelBuffer(options: {
 
     const totalValues: Array<string | number> = [
       'TOTAUX DU MOIS',
+      `${emp.expected_working_days} j ouvrables`,
       `Présents : ${emp.days_present} j`,
       `Absences : ${emp.days_absent} j`,
-      `Retards : ${emp.days_late}`,
       emp.total_worked_minutes / 1440,
       emp.total_late_minutes / 1440,
-      `Présence : ${emp.attendance_rate}%`,
-      `${checkinPhotoCount} photo(s)`,
-      `${checkoutPhotoCount} photo(s)`,
+      `Retards : ${emp.days_late} (${emp.attendance_rate}%)`,
+      `${checkinPhotoCount} Oui`,
+      `${checkoutPhotoCount} Oui`,
+      '-',
     ];
 
     totalValues.forEach((val, i) => {
@@ -659,12 +806,7 @@ export async function generateMonthlyExcelBuffer(options: {
       cell.value = val;
       cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE2E8F0' } };
       cell.font = { bold: true, size: 10, color: { argb: 'FF0F172A' } };
-      cell.border = {
-        top: { style: 'medium', color: { argb: 'FF475569' } },
-        left: { style: 'thin', color: { argb: 'FF94A3B8' } },
-        bottom: { style: 'medium', color: { argb: 'FF475569' } },
-        right: { style: 'thin', color: { argb: 'FF94A3B8' } },
-      };
+      cell.border = TOTALS_BORDER;
       cell.alignment = {
         vertical: 'middle',
         horizontal: i === 0 ? 'left' : 'center',
@@ -674,7 +816,52 @@ export async function generateMonthlyExcelBuffer(options: {
       }
     });
 
-    applyAutoColumnWidths(sheet, [16, 15, 18, 22, 20, 16, 18, 15, 15]);
+    // Signature area below totals row
+    const sigTitleRowNum = totalRowNum + 2;
+    const sigBoxRowNum = totalRowNum + 3;
+    const sigDateRowNum = totalRowNum + 4;
+
+    sheet.mergeCells(`A${sigTitleRowNum}:D${sigTitleRowNum}`);
+    const sigEmpTitle = sheet.getCell(`A${sigTitleRowNum}`);
+    sigEmpTitle.value = "Signature de l'employé";
+    sigEmpTitle.font = { bold: true, size: 10, color: { argb: 'FF1E3A8A' } };
+    sigEmpTitle.alignment = { horizontal: 'center', vertical: 'middle' };
+    sigEmpTitle.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
+
+    sheet.mergeCells(`F${sigTitleRowNum}:J${sigTitleRowNum}`);
+    const sigAdminTitle = sheet.getCell(`F${sigTitleRowNum}`);
+    sigAdminTitle.value = 'Signature du responsable';
+    sigAdminTitle.font = { bold: true, size: 10, color: { argb: 'FF1E3A8A' } };
+    sigAdminTitle.alignment = { horizontal: 'center', vertical: 'middle' };
+    sigAdminTitle.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
+
+    sheet.mergeCells(`A${sigBoxRowNum}:D${sigBoxRowNum}`);
+    sheet.mergeCells(`F${sigBoxRowNum}:J${sigBoxRowNum}`);
+    sheet.getRow(sigBoxRowNum).height = 42;
+
+    sheet.mergeCells(`A${sigDateRowNum}:D${sigDateRowNum}`);
+    const sigEmpDate = sheet.getCell(`A${sigDateRowNum}`);
+    sigEmpDate.value = 'Date : ____ / ____ / ________';
+    sigEmpDate.font = { size: 9, color: { argb: 'FF475569' } };
+    sigEmpDate.alignment = { horizontal: 'center', vertical: 'middle' };
+
+    sheet.mergeCells(`F${sigDateRowNum}:J${sigDateRowNum}`);
+    const sigAdminDate = sheet.getCell(`F${sigDateRowNum}`);
+    sigAdminDate.value = 'Date : ____ / ____ / ________';
+    sigAdminDate.font = { size: 9, color: { argb: 'FF475569' } };
+    sigAdminDate.alignment = { horizontal: 'center', vertical: 'middle' };
+
+    for (const r of [sigTitleRowNum, sigBoxRowNum, sigDateRowNum]) {
+      for (const c of [1, 2, 3, 4, 6, 7, 8, 9, 10]) {
+        sheet.getRow(r).getCell(c).border = THIN_BORDER;
+      }
+    }
+
+    applyAutoColumnWidths(
+      sheet,
+      [14, 14, 16, 20, 18, 14, 14, 14, 14, 28],
+      empHeaderRowNum
+    );
   }
 
   const out = await workbook.xlsx.writeBuffer();
