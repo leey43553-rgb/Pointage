@@ -4,6 +4,14 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+export interface PublicHolidayEntry {
+  date: string;
+  type: 'holiday' | 'leave';
+  label: string;
+}
+
+export type PhotoRequirement = 'none' | 'checkin_only' | 'both';
+
 export interface SettingsRow {
   id: number;
   company_name: string;
@@ -11,6 +19,10 @@ export interface SettingsRow {
   official_start_time: string;
   grace_minutes: number;
   allowed_network_prefix: string;
+  working_days: string;
+  public_holidays: string;
+  photo_requirement: PhotoRequirement;
+  photo_retention_days: number;
   updated_at: string;
 }
 
@@ -41,6 +53,8 @@ export interface AttendanceRow {
   checkout_time: string | null;
   checkin_ip: string | null;
   checkout_ip: string | null;
+  checkin_photo: string | null;
+  checkout_photo: string | null;
   is_late: number;
   late_minutes: number;
   worked_minutes: number;
@@ -67,6 +81,7 @@ export function getLocalDateTimeIso(date: Date = new Date()): string {
 
 const APP_ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const DB_PATH = path.join(APP_ROOT_DIR, 'pointage.db');
+export const PHOTOS_DIR = path.join(APP_ROOT_DIR, 'photos');
 
 export const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
@@ -81,6 +96,10 @@ export function initDb(): void {
       official_start_time TEXT NOT NULL DEFAULT '09:00',
       grace_minutes INTEGER NOT NULL DEFAULT 10,
       allowed_network_prefix TEXT NOT NULL DEFAULT '',
+      working_days TEXT NOT NULL DEFAULT '[0,1,2,3,4]',
+      public_holidays TEXT NOT NULL DEFAULT '[]',
+      photo_requirement TEXT NOT NULL DEFAULT 'both',
+      photo_retention_days INTEGER NOT NULL DEFAULT 90,
       updated_at TEXT NOT NULL
     );
 
@@ -111,6 +130,8 @@ export function initDb(): void {
       checkout_time TEXT,
       checkin_ip TEXT,
       checkout_ip TEXT,
+      checkin_photo TEXT DEFAULT NULL,
+      checkout_photo TEXT DEFAULT NULL,
       is_late INTEGER NOT NULL DEFAULT 0,
       late_minutes INTEGER NOT NULL DEFAULT 0,
       worked_minutes INTEGER NOT NULL DEFAULT 0,
@@ -141,12 +162,38 @@ export function initDb(): void {
     CREATE INDEX IF NOT EXISTS idx_logs_date ON attendance_logs(log_date);
   `);
 
+  // Migrate existing settings table if columns are missing
+  const settingsCols = db.prepare('PRAGMA table_info(settings)').all() as Array<{ name: string }>;
+  const colNames = new Set(settingsCols.map((c) => c.name));
+  if (!colNames.has('working_days')) {
+    db.exec(`ALTER TABLE settings ADD COLUMN working_days TEXT NOT NULL DEFAULT '[0,1,2,3,4]'`);
+  }
+  if (!colNames.has('public_holidays')) {
+    db.exec(`ALTER TABLE settings ADD COLUMN public_holidays TEXT NOT NULL DEFAULT '[]'`);
+  }
+  if (!colNames.has('photo_requirement')) {
+    db.exec(`ALTER TABLE settings ADD COLUMN photo_requirement TEXT NOT NULL DEFAULT 'both'`);
+  }
+  if (!colNames.has('photo_retention_days')) {
+    db.exec(`ALTER TABLE settings ADD COLUMN photo_retention_days INTEGER NOT NULL DEFAULT 90`);
+  }
+
+  // Migrate existing attendance table if photo columns are missing
+  const attCols = db.prepare('PRAGMA table_info(attendance)').all() as Array<{ name: string }>;
+  const attColNames = new Set(attCols.map((c) => c.name));
+  if (!attColNames.has('checkin_photo')) {
+    db.exec(`ALTER TABLE attendance ADD COLUMN checkin_photo TEXT DEFAULT NULL`);
+  }
+  if (!attColNames.has('checkout_photo')) {
+    db.exec(`ALTER TABLE attendance ADD COLUMN checkout_photo TEXT DEFAULT NULL`);
+  }
+
   const now = getLocalDateTimeIso();
   const existingSettings = db.prepare('SELECT id FROM settings WHERE id = 1').get();
   if (!existingSettings) {
     db.prepare(
-      `INSERT INTO settings (id, company_name, logo_data_url, official_start_time, grace_minutes, allowed_network_prefix, updated_at)
-       VALUES (1, 'Mon Entreprise', NULL, '09:00', 10, '', ?)`
+      `INSERT INTO settings (id, company_name, logo_data_url, official_start_time, grace_minutes, allowed_network_prefix, working_days, public_holidays, photo_requirement, photo_retention_days, updated_at)
+       VALUES (1, 'Mon Entreprise', NULL, '09:00', 10, '', '[0,1,2,3,4]', '[]', 'both', 90, ?)`
     ).run(now);
   }
 

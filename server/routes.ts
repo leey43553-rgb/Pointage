@@ -3,7 +3,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Router, type Request, type Response } from 'express';
+import type { NextFunction, Request, Response } from 'express';
+import { Router } from 'express';
 import {
   requireAdmin,
   requireEmployee,
@@ -20,8 +21,38 @@ import {
   type AdminRow,
   type AttendanceRow,
   type EmployeeRow,
+  type PhotoRequirement,
+  type PublicHolidayEntry,
   type SettingsRow,
 } from './db.ts';
+import {
+  computeMonthlyEmployeeSummaries,
+  generateMonthlyExcelBuffer,
+  parsePublicHolidays,
+  parseWorkingDays,
+} from './excelReport.ts';
+import {
+  cleanupOldPhotos,
+  photoUploadMiddleware,
+  resolveSafePhotoPath,
+  saveAttendancePhoto,
+} from './photos.ts';
+
+function handlePhotoUpload(req: Request, res: Response, next: NextFunction): void {
+  photoUploadMiddleware.single('photo')(req, res, (err: unknown) => {
+    if (err) {
+      const msg =
+        err instanceof Error && err.message.includes('File too large')
+          ? 'La photo dépasse la taille maximale autorisée (1 Mo).'
+          : err instanceof Error
+          ? err.message
+          : 'Erreur lors de la réception de la photo.';
+      res.status(400).json({ error: msg });
+      return;
+    }
+    next();
+  });
+}
 
 const LOCKOUT_MAX_ATTEMPTS = 5;
 const LOCKOUT_DURATION_MS = 5 * 60 * 1000; // 5 minutes
@@ -135,6 +166,7 @@ export function createApiRouter(): Router {
       logo_data_url: settings.logo_data_url,
       official_start_time: settings.official_start_time,
       grace_minutes: settings.grace_minutes,
+      photo_requirement: settings.photo_requirement || 'both',
       server_time: getLocalTimeString(),
       server_date: getLocalDateString(),
       client_ip: getClientIp(req),
@@ -204,6 +236,7 @@ export function createApiRouter(): Router {
       exp: Date.now() + 5 * 60 * 1000,
     });
 
+    const settings = getSettings();
     res.json({
       token,
       employee: {
@@ -213,6 +246,7 @@ export function createApiRouter(): Router {
         job_title: employee.job_title,
       },
       today_attendance: todayAttendance || null,
+      photo_requirement: settings.photo_requirement || 'both',
       server_time: getLocalTimeString(),
       server_date: today,
     });
@@ -275,6 +309,7 @@ export function createApiRouter(): Router {
       .prepare('SELECT * FROM attendance WHERE employee_id = ? AND work_date = ?')
       .get(emp.id, today) as AttendanceRow | undefined;
 
+    const settings = getSettings();
     res.json({
       employee: {
         id: emp.id,
@@ -283,6 +318,7 @@ export function createApiRouter(): Router {
         job_title: emp.job_title,
       },
       today_attendance: todayAttendance || null,
+      photo_requirement: settings.photo_requirement || 'both',
       server_time: getLocalTimeString(),
       server_date: today,
     });
@@ -305,131 +341,193 @@ export function createApiRouter(): Router {
     res.json({ records: rows, from_date: fromDate, to_date: getLocalDateString() });
   });
 
-  router.post('/attendance/checkin', requireEmployee, (req: AuthenticatedRequest, res: Response) => {
-    const emp = req.employeeUser!;
-    const settings = getSettings();
-    const clientIp = getClientIp(req);
+  router.post(
+    '/attendance/checkin',
+    requireEmployee,
+    handlePhotoUpload,
+    (req: AuthenticatedRequest, res: Response) => {
+      const emp = req.employeeUser!;
+      const settings = getSettings();
+      const clientIp = getClientIp(req);
 
-    if (!isNetworkAllowed(clientIp, settings)) {
-      res.status(403).json({
-        error: "Vous devez être connecté au wifi de l'entreprise.",
+      if (!isNetworkAllowed(clientIp, settings)) {
+        res.status(403).json({
+          error: "Vous devez être connecté au wifi de l'entreprise.",
+        });
+        return;
+      }
+
+      const now = new Date();
+      const today = getLocalDateString(now);
+      const timeStr = getLocalTimeString(now);
+      const nowIso = getLocalDateTimeIso(now);
+
+      const existing = db
+        .prepare('SELECT * FROM attendance WHERE employee_id = ? AND work_date = ?')
+        .get(emp.id, today) as AttendanceRow | undefined;
+
+      if (existing && existing.checkin_time) {
+        res.status(409).json({
+          error: `Votre arrivée a déjà été enregistrée aujourd'hui à ${existing.checkin_time.slice(0, 5)}.`,
+        });
+        return;
+      }
+
+      const photoReq = settings.photo_requirement || 'both';
+      const needsPhoto = photoReq === 'checkin_only' || photoReq === 'both';
+      if (needsPhoto && !req.file) {
+        res.status(400).json({
+          error: 'Une photo est obligatoire pour enregistrer votre arrivée.',
+        });
+        return;
+      }
+
+      let savedPhotoPath: string | null = null;
+      if (req.file) {
+        try {
+          savedPhotoPath = saveAttendancePhoto({
+            buffer: req.file.buffer,
+            workDate: today,
+            employeeId: emp.id,
+            action: 'checkin',
+          });
+        } catch (err) {
+          res.status(400).json({
+            error: err instanceof Error ? err.message : 'Photo invalide.',
+          });
+          return;
+        }
+      }
+
+      const officialStartMins = parseTimeToMinutes(settings.official_start_time);
+      const cutoffMins = officialStartMins + (settings.grace_minutes || 0);
+      const arrivalMins = now.getHours() * 60 + now.getMinutes();
+
+      const isLate = arrivalMins > cutoffMins ? 1 : 0;
+      const lateMinutes = isLate ? Math.max(1, arrivalMins - officialStartMins) : 0;
+
+      const fullName = `${emp.first_name} ${emp.last_name}`.trim();
+
+      const runTx = db.transaction(() => {
+        db.prepare(
+          `INSERT INTO attendance (employee_id, work_date, checkin_time, checkin_ip, checkin_photo, is_late, late_minutes, worked_minutes, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`
+        ).run(emp.id, today, timeStr, clientIp, savedPhotoPath, isLate, lateMinutes, nowIso);
+
+        db.prepare(
+          `INSERT INTO attendance_logs (employee_id, employee_name, action, log_date, log_time, ip_address, created_at)
+           VALUES (?, ?, 'checkin', ?, ?, ?, ?)`
+        ).run(emp.id, fullName, today, timeStr, clientIp, nowIso);
       });
-      return;
-    }
 
-    const now = new Date();
-    const today = getLocalDateString(now);
-    const timeStr = getLocalTimeString(now);
-    const nowIso = getLocalDateTimeIso(now);
+      runTx();
 
-    const existing = db
-      .prepare('SELECT * FROM attendance WHERE employee_id = ? AND work_date = ?')
-      .get(emp.id, today) as AttendanceRow | undefined;
+      const record = db
+        .prepare('SELECT * FROM attendance WHERE employee_id = ? AND work_date = ?')
+        .get(emp.id, today) as AttendanceRow;
 
-    if (existing && existing.checkin_time) {
-      res.status(409).json({
-        error: `Votre arrivée a déjà été enregistrée aujourd'hui à ${existing.checkin_time.slice(0, 5)}.`,
+      res.json({
+        attendance: record,
+        message: `Bonjour ${emp.first_name}, votre arrivée a bien été enregistrée à ${timeStr.slice(0, 5)}.`,
       });
-      return;
     }
+  );
 
-    const officialStartMins = parseTimeToMinutes(settings.official_start_time);
-    const cutoffMins = officialStartMins + (settings.grace_minutes || 0);
-    const arrivalMins = now.getHours() * 60 + now.getMinutes();
+  router.post(
+    '/attendance/checkout',
+    requireEmployee,
+    handlePhotoUpload,
+    (req: AuthenticatedRequest, res: Response) => {
+      const emp = req.employeeUser!;
+      const settings = getSettings();
+      const clientIp = getClientIp(req);
 
-    const isLate = arrivalMins > cutoffMins ? 1 : 0;
-    const lateMinutes = isLate ? Math.max(1, arrivalMins - officialStartMins) : 0;
+      if (!isNetworkAllowed(clientIp, settings)) {
+        res.status(403).json({
+          error: "Vous devez être connecté au wifi de l'entreprise.",
+        });
+        return;
+      }
 
-    const fullName = `${emp.first_name} ${emp.last_name}`.trim();
+      const now = new Date();
+      const today = getLocalDateString(now);
+      const timeStr = getLocalTimeString(now);
+      const nowIso = getLocalDateTimeIso(now);
 
-    const runTx = db.transaction(() => {
-      db.prepare(
-        `INSERT INTO attendance (employee_id, work_date, checkin_time, checkin_ip, is_late, late_minutes, worked_minutes, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 0, ?)`
-      ).run(emp.id, today, timeStr, clientIp, isLate, lateMinutes, nowIso);
+      const existing = db
+        .prepare('SELECT * FROM attendance WHERE employee_id = ? AND work_date = ?')
+        .get(emp.id, today) as AttendanceRow | undefined;
 
-      db.prepare(
-        `INSERT INTO attendance_logs (employee_id, employee_name, action, log_date, log_time, ip_address, created_at)
-         VALUES (?, ?, 'checkin', ?, ?, ?, ?)`
-      ).run(emp.id, fullName, today, timeStr, clientIp, nowIso);
-    });
+      if (!existing || !existing.checkin_time) {
+        res.status(400).json({
+          error: "Vous devez d'abord pointer votre arrivée avec le bouton vert.",
+        });
+        return;
+      }
 
-    runTx();
+      if (existing.checkout_time) {
+        res.status(409).json({
+          error: `Votre départ a déjà été enregistré aujourd'hui à ${existing.checkout_time.slice(0, 5)}.`,
+        });
+        return;
+      }
 
-    const record = db
-      .prepare('SELECT * FROM attendance WHERE employee_id = ? AND work_date = ?')
-      .get(emp.id, today) as AttendanceRow;
+      const photoReq = settings.photo_requirement || 'both';
+      const needsPhoto = photoReq === 'both';
+      if (needsPhoto && !req.file) {
+        res.status(400).json({
+          error: 'Une photo est obligatoire pour enregistrer votre départ.',
+        });
+        return;
+      }
 
-    res.json({
-      attendance: record,
-      message: `Bonjour ${emp.first_name}, votre arrivée a bien été enregistrée à ${timeStr.slice(0, 5)}.`,
-    });
-  });
+      let savedPhotoPath: string | null = null;
+      if (req.file) {
+        try {
+          savedPhotoPath = saveAttendancePhoto({
+            buffer: req.file.buffer,
+            workDate: today,
+            employeeId: emp.id,
+            action: 'checkout',
+          });
+        } catch (err) {
+          res.status(400).json({
+            error: err instanceof Error ? err.message : 'Photo invalide.',
+          });
+          return;
+        }
+      }
 
-  router.post('/attendance/checkout', requireEmployee, (req: AuthenticatedRequest, res: Response) => {
-    const emp = req.employeeUser!;
-    const settings = getSettings();
-    const clientIp = getClientIp(req);
+      const checkinMins = parseTimeToMinutes(existing.checkin_time);
+      const checkoutMins = now.getHours() * 60 + now.getMinutes();
+      const workedMinutes = Math.max(0, checkoutMins - checkinMins);
+      const fullName = `${emp.first_name} ${emp.last_name}`.trim();
 
-    if (!isNetworkAllowed(clientIp, settings)) {
-      res.status(403).json({
-        error: "Vous devez être connecté au wifi de l'entreprise.",
+      const runTx = db.transaction(() => {
+        db.prepare(
+          `UPDATE attendance
+           SET checkout_time = ?, checkout_ip = ?, checkout_photo = ?, worked_minutes = ?
+           WHERE id = ?`
+        ).run(timeStr, clientIp, savedPhotoPath, workedMinutes, existing.id);
+
+        db.prepare(
+          `INSERT INTO attendance_logs (employee_id, employee_name, action, log_date, log_time, ip_address, created_at)
+           VALUES (?, ?, 'checkout', ?, ?, ?, ?)`
+        ).run(emp.id, fullName, today, timeStr, clientIp, nowIso);
       });
-      return;
-    }
 
-    const now = new Date();
-    const today = getLocalDateString(now);
-    const timeStr = getLocalTimeString(now);
-    const nowIso = getLocalDateTimeIso(now);
+      runTx();
 
-    const existing = db
-      .prepare('SELECT * FROM attendance WHERE employee_id = ? AND work_date = ?')
-      .get(emp.id, today) as AttendanceRow | undefined;
+      const record = db
+        .prepare('SELECT * FROM attendance WHERE id = ?')
+        .get(existing.id) as AttendanceRow;
 
-    if (!existing || !existing.checkin_time) {
-      res.status(400).json({
-        error: "Vous devez d'abord pointer votre arrivée avec le bouton vert.",
+      res.json({
+        attendance: record,
+        message: `Au revoir ${emp.first_name}, votre départ a bien été enregistré à ${timeStr.slice(0, 5)}.`,
       });
-      return;
     }
-
-    if (existing.checkout_time) {
-      res.status(409).json({
-        error: `Votre départ a déjà été enregistré aujourd'hui à ${existing.checkout_time.slice(0, 5)}.`,
-      });
-      return;
-    }
-
-    const checkinMins = parseTimeToMinutes(existing.checkin_time);
-    const checkoutMins = now.getHours() * 60 + now.getMinutes();
-    const workedMinutes = Math.max(0, checkoutMins - checkinMins);
-    const fullName = `${emp.first_name} ${emp.last_name}`.trim();
-
-    const runTx = db.transaction(() => {
-      db.prepare(
-        `UPDATE attendance
-         SET checkout_time = ?, checkout_ip = ?, worked_minutes = ?
-         WHERE id = ?`
-      ).run(timeStr, clientIp, workedMinutes, existing.id);
-
-      db.prepare(
-        `INSERT INTO attendance_logs (employee_id, employee_name, action, log_date, log_time, ip_address, created_at)
-         VALUES (?, ?, 'checkout', ?, ?, ?, ?)`
-      ).run(emp.id, fullName, today, timeStr, clientIp, nowIso);
-    });
-
-    runTx();
-
-    const record = db
-      .prepare('SELECT * FROM attendance WHERE id = ?')
-      .get(existing.id) as AttendanceRow;
-
-    res.json({
-      attendance: record,
-      message: `Au revoir ${emp.first_name}, votre départ a bien été enregistré à ${timeStr.slice(0, 5)}.`,
-    });
-  });
+  );
 
   // ---------------- ADMIN & SUPER ADMIN ROUTES ----------------
   router.get('/admin/me', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
@@ -488,6 +586,7 @@ export function createApiRouter(): Router {
         absentCount++;
       }
       return {
+        attendance_id: att?.id || null,
         employee_id: emp.id,
         first_name: emp.first_name,
         last_name: emp.last_name,
@@ -499,6 +598,8 @@ export function createApiRouter(): Router {
         worked_minutes: att?.worked_minutes || 0,
         checkin_ip: att?.checkin_ip || null,
         checkout_ip: att?.checkout_ip || null,
+        has_checkin_photo: Boolean(att?.checkin_photo),
+        has_checkout_photo: Boolean(att?.checkout_photo),
       };
     });
 
@@ -533,45 +634,66 @@ export function createApiRouter(): Router {
     empSql += ' ORDER BY last_name ASC, first_name ASC';
 
     const employees = db.prepare(empSql).all(...empParams) as Array<Omit<EmployeeRow, 'code' | 'created_at'>>;
+    const attendanceRecords = db
+      .prepare('SELECT * FROM attendance WHERE work_date LIKE ?')
+      .all(`${month}-%`) as AttendanceRow[];
+    const settings = getSettings();
 
-    const aggRows = db
-      .prepare(
-        `SELECT
-           employee_id,
-           COUNT(*) as days_present,
-           SUM(CASE WHEN is_late = 1 THEN 1 ELSE 0 END) as days_late,
-           COALESCE(SUM(late_minutes), 0) as total_late_minutes,
-           COALESCE(SUM(worked_minutes), 0) as total_worked_minutes
-         FROM attendance
-         WHERE work_date LIKE ?
-         GROUP BY employee_id`
-      )
-      .all(`${month}-%`) as Array<{
-        employee_id: number;
-        days_present: number;
-        days_late: number;
-        total_late_minutes: number;
-        total_worked_minutes: number;
-      }>;
-
-    const aggMap = new Map(aggRows.map((r) => [r.employee_id, r]));
-
-    const rows = employees.map((emp) => {
-      const agg = aggMap.get(emp.id);
-      return {
-        employee_id: emp.id,
-        first_name: emp.first_name,
-        last_name: emp.last_name,
-        job_title: emp.job_title,
-        is_active: emp.is_active === 1,
-        days_present: agg?.days_present || 0,
-        days_late: agg?.days_late || 0,
-        total_late_minutes: agg?.total_late_minutes || 0,
-        total_worked_minutes: agg?.total_worked_minutes || 0,
-      };
-    });
+    const summaries = computeMonthlyEmployeeSummaries(month, employees, attendanceRecords, settings);
+    const rows = summaries.map(({ daily_rows: _daily, ...rest }) => rest);
 
     res.json({ month, rows });
+  });
+
+  router.get('/admin/export/excel', requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
+    const now = new Date();
+    const defaultMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const month = typeof req.query.month === 'string' && /^\d{4}-\d{2}$/.test(req.query.month)
+      ? req.query.month
+      : defaultMonth;
+
+    const employeeId = req.query.employeeId ? Number(req.query.employeeId) : null;
+    const isSingleEmployee = Boolean(employeeId && Number.isFinite(employeeId));
+
+    let empSql = 'SELECT id, first_name, last_name, job_title, is_active FROM employees';
+    const empParams: Array<number> = [];
+    if (isSingleEmployee && employeeId !== null) {
+      empSql += ' WHERE id = ?';
+      empParams.push(employeeId);
+    }
+    empSql += ' ORDER BY last_name ASC, first_name ASC';
+
+    const employees = db.prepare(empSql).all(...empParams) as Array<Omit<EmployeeRow, 'code' | 'created_at'>>;
+    if (isSingleEmployee && employees.length === 0) {
+      res.status(404).json({ error: 'Employé introuvable.' });
+      return;
+    }
+
+    const attendanceRecords = db
+      .prepare('SELECT * FROM attendance WHERE work_date LIKE ?')
+      .all(`${month}-%`) as AttendanceRow[];
+    const settings = getSettings();
+
+    const summaries = computeMonthlyEmployeeSummaries(month, employees, attendanceRecords, settings);
+
+    try {
+      const buffer = await generateMonthlyExcelBuffer({
+        month,
+        summaries,
+        includeSummarySheet: !isSingleEmployee,
+        companyName: settings.company_name,
+      });
+
+      const filename = `Rapport-pointage-${month}.xlsx`;
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      );
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.send(buffer);
+    } catch {
+      res.status(500).json({ error: 'Erreur lors de la génération du fichier Excel.' });
+    }
   });
 
   router.get('/admin/attendance', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
@@ -601,6 +723,8 @@ export function createApiRouter(): Router {
         a.checkout_time,
         a.checkin_ip,
         a.checkout_ip,
+        CASE WHEN a.checkin_photo IS NOT NULL THEN 1 ELSE 0 END as has_checkin_photo,
+        CASE WHEN a.checkout_photo IS NOT NULL THEN 1 ELSE 0 END as has_checkout_photo,
         a.is_late,
         a.late_minutes,
         a.worked_minutes
@@ -625,6 +749,38 @@ export function createApiRouter(): Router {
     const records = db.prepare(sql).all(...params);
     res.json({ from, to, records });
   });
+
+  // Protected admin-only photo endpoint (no public URL)
+  router.get(
+    '/admin/attendance/:id/photo/:kind',
+    requireAdmin,
+    (req: AuthenticatedRequest, res: Response) => {
+      const id = Number(req.params.id);
+      const kind = req.params.kind === 'checkout' ? 'checkout' : req.params.kind === 'checkin' ? 'checkin' : null;
+      if (!Number.isFinite(id) || !kind) {
+        res.status(400).json({ error: 'Requête photo invalide.' });
+        return;
+      }
+
+      const row = db
+        .prepare('SELECT checkin_photo, checkout_photo FROM attendance WHERE id = ?')
+        .get(id) as { checkin_photo: string | null; checkout_photo: string | null } | undefined;
+      if (!row) {
+        res.status(404).json({ error: 'Pointage introuvable.' });
+        return;
+      }
+
+      const relPath = kind === 'checkin' ? row.checkin_photo : row.checkout_photo;
+      const safePath = resolveSafePhotoPath(relPath);
+      if (!safePath) {
+        res.status(404).json({ error: 'Photo introuvable.' });
+        return;
+      }
+
+      res.setHeader('Cache-Control', 'private, max-age=3600');
+      res.sendFile(safePath);
+    }
+  );
 
   router.get('/admin/logs', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
     const from = typeof req.query.from === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.from)
@@ -1029,7 +1185,11 @@ export function createApiRouter(): Router {
   router.get('/super/settings', requireSuperAdmin, (req: Request, res: Response) => {
     const settings = getSettings();
     res.json({
-      settings,
+      settings: {
+        ...settings,
+        working_days: parseWorkingDays(settings.working_days),
+        public_holidays: parsePublicHolidays(settings.public_holidays),
+      },
       lan_ips: getServerLanIps(),
       client_ip: getClientIp(req),
     });
@@ -1050,6 +1210,64 @@ export function createApiRouter(): Router {
     const allowedNetworkPrefix = typeof req.body?.allowed_network_prefix === 'string'
       ? req.body.allowed_network_prefix.trim()
       : current.allowed_network_prefix;
+
+    let photoRequirement: PhotoRequirement = current.photo_requirement || 'both';
+    if (
+      req.body?.photo_requirement === 'none' ||
+      req.body?.photo_requirement === 'checkin_only' ||
+      req.body?.photo_requirement === 'both'
+    ) {
+      photoRequirement = req.body.photo_requirement;
+    }
+
+    const retentionRaw =
+      req.body?.photo_retention_days !== undefined
+        ? Number(req.body.photo_retention_days)
+        : current.photo_retention_days;
+    if (!Number.isFinite(retentionRaw) || retentionRaw < 1 || retentionRaw > 3650) {
+      res.status(400).json({
+        error: 'La durée de conservation des photos doit être comprise entre 1 et 3650 jours.',
+      });
+      return;
+    }
+
+    let workingDaysList = parseWorkingDays(current.working_days);
+    if (Array.isArray(req.body?.working_days)) {
+      const cleaned = (req.body.working_days as unknown[])
+        .map((n) => Number(n))
+        .filter((n) => Number.isInteger(n) && n >= 0 && n <= 6);
+      if (cleaned.length === 0) {
+        res.status(400).json({ error: 'Veuillez sélectionner au moins un jour travaillé.' });
+        return;
+      }
+      workingDaysList = Array.from(new Set(cleaned)).sort();
+    }
+
+    let publicHolidaysList = parsePublicHolidays(current.public_holidays);
+    if (Array.isArray(req.body?.public_holidays)) {
+      const cleanedHolidays: PublicHolidayEntry[] = [];
+      const seenDates = new Set<string>();
+      for (const item of req.body.public_holidays as unknown[]) {
+        if (
+          item &&
+          typeof item === 'object' &&
+          typeof (item as PublicHolidayEntry).date === 'string' &&
+          /^\d{4}-\d{2}-\d{2}$/.test((item as PublicHolidayEntry).date)
+        ) {
+          const entry = item as PublicHolidayEntry;
+          if (!seenDates.has(entry.date)) {
+            seenDates.add(entry.date);
+            cleanedHolidays.push({
+              date: entry.date,
+              type: entry.type === 'leave' ? 'leave' : 'holiday',
+              label: typeof entry.label === 'string' ? entry.label.trim().slice(0, 80) : '',
+            });
+          }
+        }
+      }
+      cleanedHolidays.sort((a, b) => a.date.localeCompare(b.date));
+      publicHolidaysList = cleanedHolidays;
+    }
 
     let logoDataUrl = current.logo_data_url;
     if (req.body?.logo_data_url === null || req.body?.logo_data_url === '') {
@@ -1076,14 +1294,34 @@ export function createApiRouter(): Router {
     }
 
     const now = getLocalDateTimeIso();
+    const retentionDays = Math.round(retentionRaw);
     db.prepare(
       `UPDATE settings
-       SET company_name = ?, logo_data_url = ?, official_start_time = ?, grace_minutes = ?, allowed_network_prefix = ?, updated_at = ?
+       SET company_name = ?, logo_data_url = ?, official_start_time = ?, grace_minutes = ?, allowed_network_prefix = ?, working_days = ?, public_holidays = ?, photo_requirement = ?, photo_retention_days = ?, updated_at = ?
        WHERE id = 1`
-    ).run(companyName, logoDataUrl, officialStartTime, Math.round(graceMinutesRaw), allowedNetworkPrefix, now);
+    ).run(
+      companyName,
+      logoDataUrl,
+      officialStartTime,
+      Math.round(graceMinutesRaw),
+      allowedNetworkPrefix,
+      JSON.stringify(workingDaysList),
+      JSON.stringify(publicHolidaysList),
+      photoRequirement,
+      retentionDays,
+      now
+    );
+
+    cleanupOldPhotos(retentionDays);
 
     const updated = getSettings();
-    res.json({ settings: updated });
+    res.json({
+      settings: {
+        ...updated,
+        working_days: parseWorkingDays(updated.working_days),
+        public_holidays: parsePublicHolidays(updated.public_holidays),
+      },
+    });
   });
 
   router.get('/super/backup', requireSuperAdmin, async (_req: AuthenticatedRequest, res: Response) => {

@@ -3,12 +3,24 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DB_PATH, initDb } from './server/db.ts';
+import { DB_PATH, db, initDb, type SettingsRow } from './server/db.ts';
+import { cleanupOldPhotos } from './server/photos.ts';
 import { createApiRouter, getServerLanIps } from './server/routes.ts';
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = '0.0.0.0';
 const APP_ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+function runPhotoRetentionJob(): void {
+  try {
+    const row = db.prepare('SELECT photo_retention_days FROM settings WHERE id = 1').get() as
+      | Pick<SettingsRow, 'photo_retention_days'>
+      | undefined;
+    cleanupOldPhotos(row?.photo_retention_days ?? 90);
+  } catch {
+    // ignore startup cleanup error
+  }
+}
 
 async function startServer() {
   const isProdMode =
@@ -18,6 +30,8 @@ async function startServer() {
   }
 
   initDb();
+  runPhotoRetentionJob();
+  setInterval(runPhotoRetentionJob, 6 * 60 * 60 * 1000).unref();
 
   const app = express();
   app.use(express.json({ limit: '1mb' }));

@@ -5,7 +5,13 @@ import { AdminLoginScreen } from './components/AdminLoginScreen';
 import { EmployeePinScreen } from './components/EmployeePinScreen';
 import { EmployeePortal } from './components/EmployeePortal';
 import { OfflineIndicator } from './pwa/OfflineIndicator';
-import type { AdminUser, AttendanceRecord, EmployeeProfile, PublicConfig } from './types';
+import type {
+  AdminUser,
+  AttendanceRecord,
+  EmployeeProfile,
+  PhotoRequirement,
+  PublicConfig,
+} from './types';
 
 type AppSession =
   | { kind: 'pin' }
@@ -14,6 +20,7 @@ type AppSession =
       token: string;
       employee: EmployeeProfile;
       todayAttendance: AttendanceRecord | null;
+      photoRequirement: PhotoRequirement;
     }
   | { kind: 'admin_login' }
   | {
@@ -52,6 +59,7 @@ export default function App() {
               token: data.token,
               employee: data.employee,
               todayAttendance: data.today_attendance,
+              photoRequirement: data.photo_requirement || config?.photo_requirement || 'both',
             })
           }
           onOpenAdminLogin={() => setSession({ kind: 'admin_login' })}
@@ -63,6 +71,7 @@ export default function App() {
           token={session.token}
           employee={session.employee}
           initialAttendance={session.todayAttendance}
+          photoRequirement={config?.photo_requirement || session.photoRequirement}
           config={config}
           onLogout={() => {
             void loadConfig();

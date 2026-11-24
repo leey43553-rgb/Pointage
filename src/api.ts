@@ -59,6 +59,52 @@ export async function apiRequest<T>(
   return data as T;
 }
 
+export async function apiFormDataRequest<T>(
+  path: string,
+  options: {
+    method?: string;
+    formData: FormData;
+    token?: string | null;
+  }
+): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (options.token) {
+    headers['Authorization'] = `Bearer ${options.token}`;
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      method: options.method || 'POST',
+      headers,
+      body: options.formData,
+    });
+  } catch {
+    throw new ApiError('Impossible de joindre le serveur local. Vérifiez le Wi-Fi.', 0);
+  }
+
+  const text = await response.text();
+  let data: Record<string, unknown> = {};
+  if (text) {
+    try {
+      data = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      data = {};
+    }
+  }
+
+  if (!response.ok) {
+    const errMsg =
+      typeof data.error === 'string' && data.error
+        ? data.error
+        : `Erreur serveur (${response.status})`;
+    const retry = typeof data.retry_after_seconds === 'number' ? data.retry_after_seconds : undefined;
+    throw new ApiError(errMsg, response.status, retry);
+  }
+
+  return data as T;
+}
+
 export async function downloadAuthenticatedFile(
   path: string,
   token: string,

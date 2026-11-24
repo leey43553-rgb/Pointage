@@ -35,6 +35,11 @@ import type {
 import { AdminSuperAdminsTab } from './AdminSuperAdminsTab';
 import { AdminSuperEmployeesTab } from './AdminSuperEmployeesTab';
 import { AdminSuperSettingsTab } from './AdminSuperSettingsTab';
+import {
+  ProtectedPhotoModal,
+  ProtectedPhotoThumbnail,
+  type PhotoModalPayload,
+} from './ProtectedPhoto';
 
 type AdminTab = 'today' | 'monthly' | 'history' | 'employees' | 'admins' | 'settings';
 
@@ -90,6 +95,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   const [error, setError] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
+  const [selectedPhoto, setSelectedPhoto] = useState<PhotoModalPayload | null>(null);
 
   const isSuperAdmin = admin.role === 'super_admin';
 
@@ -188,19 +194,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     if (activeTab === 'history') void loadHistory();
   }, [activeTab, loadToday, loadMonthly, loadHistory]);
 
-  const handleExportMonthlyCsv = async () => {
+  const handleExportMonthlyExcel = async () => {
     if (exporting) return;
     setExporting(true);
+    setError(null);
     try {
-      const params = new URLSearchParams({ type: 'monthly', month: monthFilter });
+      const params = new URLSearchParams({ month: monthFilter });
       if (monthlyEmpFilter) params.set('employeeId', monthlyEmpFilter);
       await downloadAuthenticatedFile(
-        `/api/admin/export/csv?${params.toString()}`,
+        `/api/admin/export/excel?${params.toString()}`,
         token,
-        `pointage-mensuel-${monthFilter}.csv`
+        `Rapport-pointage-${monthFilter}.xlsx`
       );
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Erreur lors de l'export CSV.");
+      setError(err instanceof ApiError ? err.message : "Erreur lors de l'export Excel.");
     } finally {
       setExporting(false);
     }
@@ -444,52 +451,98 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <th className="py-3 px-4 text-right">Arrivée</th>
                         <th className="py-3 px-4 text-right">Départ</th>
                         <th className="py-3 px-4 text-right">Durée</th>
+                        <th className="py-3 px-4">Photos</th>
                         <th className="py-3 px-4 text-right">IP</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-200 text-sm">
-                      {filteredTodayEmployees.map((emp) => (
-                        <tr key={emp.employee_id} className="hover:bg-slate-50">
-                          <td className="py-3.5 px-4 font-bold text-slate-900">
-                            {emp.first_name} {emp.last_name}
-                          </td>
-                          <td className="py-3.5 px-4 text-slate-600">
-                            {emp.job_title || '-'}
-                          </td>
-                          <td className="py-3.5 px-4">
-                            {emp.status === 'present' && (
-                              <span className="inline-flex items-center gap-1.5 font-semibold text-emerald-700">
-                                <CheckCircle2 className="w-4 h-4" />
-                                Présent
-                              </span>
-                            )}
-                            {emp.status === 'late' && (
-                              <span className="inline-flex items-center gap-1.5 font-semibold text-amber-700">
-                                <AlertTriangle className="w-4 h-4" />
-                                En retard ({emp.late_minutes} min)
-                              </span>
-                            )}
-                            {emp.status === 'absent' && (
-                              <span className="inline-flex items-center gap-1.5 font-semibold text-red-700">
-                                <XCircle className="w-4 h-4" />
-                                Absent
-                              </span>
-                            )}
-                          </td>
-                          <td className="py-3.5 px-4 text-right font-mono tabular-nums text-slate-900">
-                            {emp.checkin_time ? emp.checkin_time.slice(0, 5) : '-'}
-                          </td>
-                          <td className="py-3.5 px-4 text-right font-mono tabular-nums text-slate-900">
-                            {emp.checkout_time ? emp.checkout_time.slice(0, 5) : '-'}
-                          </td>
-                          <td className="py-3.5 px-4 text-right font-mono tabular-nums text-slate-700">
-                            {emp.worked_minutes > 0 ? formatMinutesToHours(emp.worked_minutes) : '-'}
-                          </td>
-                          <td className="py-3.5 px-4 text-right font-mono text-xs text-slate-500">
-                            {emp.checkin_ip || '-'}
-                          </td>
-                        </tr>
-                      ))}
+                      {filteredTodayEmployees.map((emp) => {
+                        const empName = `${emp.first_name} ${emp.last_name}`;
+                        return (
+                          <tr key={emp.employee_id} className="hover:bg-slate-50">
+                            <td className="py-3.5 px-4 font-bold text-slate-900">
+                              {empName}
+                            </td>
+                            <td className="py-3.5 px-4 text-slate-600">
+                              {emp.job_title || '-'}
+                            </td>
+                            <td className="py-3.5 px-4">
+                              {emp.status === 'present' && (
+                                <span className="inline-flex items-center gap-1.5 font-semibold text-emerald-700">
+                                  <CheckCircle2 className="w-4 h-4" />
+                                  Présent
+                                </span>
+                              )}
+                              {emp.status === 'late' && (
+                                <span className="inline-flex items-center gap-1.5 font-semibold text-amber-700">
+                                  <AlertTriangle className="w-4 h-4" />
+                                  En retard ({emp.late_minutes} min)
+                                </span>
+                              )}
+                              {emp.status === 'absent' && (
+                                <span className="inline-flex items-center gap-1.5 font-semibold text-red-700">
+                                  <XCircle className="w-4 h-4" />
+                                  Absent
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-3.5 px-4 text-right font-mono tabular-nums text-slate-900">
+                              {emp.checkin_time ? emp.checkin_time.slice(0, 5) : '-'}
+                            </td>
+                            <td className="py-3.5 px-4 text-right font-mono tabular-nums text-slate-900">
+                              {emp.checkout_time ? emp.checkout_time.slice(0, 5) : '-'}
+                            </td>
+                            <td className="py-3.5 px-4 text-right font-mono tabular-nums text-slate-700">
+                              {emp.worked_minutes > 0 ? formatMinutesToHours(emp.worked_minutes) : '-'}
+                            </td>
+                            <td className="py-2.5 px-4">
+                              {emp.attendance_id && (emp.has_checkin_photo || emp.has_checkout_photo) ? (
+                                <div className="flex items-center gap-1.5">
+                                  {emp.has_checkin_photo && (
+                                    <ProtectedPhotoThumbnail
+                                      token={token}
+                                      attendanceId={emp.attendance_id}
+                                      kind="checkin"
+                                      employeeName={empName}
+                                      onOpen={() =>
+                                        setSelectedPhoto({
+                                          attendanceId: emp.attendance_id!,
+                                          kind: 'checkin',
+                                          employeeName: empName,
+                                          dateLabel: formatFrenchDate(todayDate),
+                                          timeLabel: emp.checkin_time ? emp.checkin_time.slice(0, 5) : '',
+                                        })
+                                      }
+                                    />
+                                  )}
+                                  {emp.has_checkout_photo && (
+                                    <ProtectedPhotoThumbnail
+                                      token={token}
+                                      attendanceId={emp.attendance_id}
+                                      kind="checkout"
+                                      employeeName={empName}
+                                      onOpen={() =>
+                                        setSelectedPhoto({
+                                          attendanceId: emp.attendance_id!,
+                                          kind: 'checkout',
+                                          employeeName: empName,
+                                          dateLabel: formatFrenchDate(todayDate),
+                                          timeLabel: emp.checkout_time ? emp.checkout_time.slice(0, 5) : '',
+                                        })
+                                      }
+                                    />
+                                  )}
+                                </div>
+                              ) : (
+                                <span className="text-xs text-slate-400">-</span>
+                              )}
+                            </td>
+                            <td className="py-3.5 px-4 text-right font-mono text-xs text-slate-500">
+                              {emp.checkin_ip || '-'}
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -531,12 +584,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
               <button
                 type="button"
-                onClick={handleExportMonthlyCsv}
+                onClick={handleExportMonthlyExcel}
                 disabled={exporting}
                 className="min-h-[40px] inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-4 py-2 text-sm font-bold text-white hover:bg-emerald-800 disabled:opacity-50 whitespace-nowrap"
               >
-                <Download className="w-4 h-4" />
-                Exporter CSV (Excel)
+                <FileSpreadsheet className="w-4 h-4" />
+                {exporting ? 'Génération Excel...' : 'Exporter Excel (.xlsx)'}
               </button>
             </div>
 
@@ -552,10 +605,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
                         <th className="py-3 px-4">Employé</th>
                         <th className="py-3 px-4">Poste</th>
-                        <th className="py-3 px-4 text-right">Jours présents</th>
-                        <th className="py-3 px-4 text-right">Jours en retard</th>
+                        <th className="py-3 px-4 text-right">Jours attendus</th>
+                        <th className="py-3 px-4 text-right">Présents</th>
+                        <th className="py-3 px-4 text-right">Absences</th>
+                        <th className="py-3 px-4 text-right">Retards</th>
                         <th className="py-3 px-4 text-right">Retard cumulé</th>
                         <th className="py-3 px-4 text-right">Heures travaillées</th>
+                        <th className="py-3 px-4 text-right">Taux</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-200 text-sm">
@@ -568,17 +624,26 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                             )}
                           </td>
                           <td className="py-3.5 px-4 text-slate-600">{row.job_title || '-'}</td>
-                          <td className="py-3.5 px-4 text-right font-mono font-bold tabular-nums text-slate-900">
+                          <td className="py-3.5 px-4 text-right font-mono tabular-nums text-slate-700">
+                            {row.expected_working_days}
+                          </td>
+                          <td className="py-3.5 px-4 text-right font-mono font-bold tabular-nums text-emerald-800">
                             {row.days_present}
+                          </td>
+                          <td className="py-3.5 px-4 text-right font-mono font-bold tabular-nums text-red-700">
+                            {row.days_absent}
                           </td>
                           <td className="py-3.5 px-4 text-right font-mono tabular-nums text-amber-800">
                             {row.days_late}
                           </td>
                           <td className="py-3.5 px-4 text-right font-mono tabular-nums text-slate-700">
-                            {row.total_late_minutes} min
+                            {formatMinutesToHours(row.total_late_minutes)}
                           </td>
                           <td className="py-3.5 px-4 text-right font-mono font-bold tabular-nums text-blue-900">
                             {formatMinutesToHours(row.total_worked_minutes)}
+                          </td>
+                          <td className="py-3.5 px-4 text-right font-mono font-semibold tabular-nums text-slate-900">
+                            {row.attendance_rate}%
                           </td>
                         </tr>
                       ))}
@@ -699,41 +764,89 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           <th className="py-3 px-4 text-right">Arrivée</th>
                           <th className="py-3 px-4 text-right">Départ</th>
                           <th className="py-3 px-4 text-right">Durée</th>
+                          <th className="py-3 px-4">Photos</th>
                           <th className="py-3 px-4 text-right">IP</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-200 text-sm">
-                        {historyRows.map((r) => (
-                          <tr key={r.id} className="hover:bg-slate-50">
-                            <td className="py-3.5 px-4 font-medium text-slate-900 capitalize">
-                              {formatFrenchDate(r.work_date)}
-                            </td>
-                            <td className="py-3.5 px-4 font-bold text-slate-900">
-                              {r.first_name} {r.last_name}
-                            </td>
-                            <td className="py-3.5 px-4">
-                              {r.is_late === 1 ? (
-                                <span className="font-semibold text-amber-700">
-                                  En retard ({r.late_minutes} min)
-                                </span>
-                              ) : (
-                                <span className="font-semibold text-emerald-700">À l'heure</span>
-                              )}
-                            </td>
-                            <td className="py-3.5 px-4 text-right font-mono tabular-nums">
-                              {r.checkin_time ? r.checkin_time.slice(0, 5) : '-'}
-                            </td>
-                            <td className="py-3.5 px-4 text-right font-mono tabular-nums">
-                              {r.checkout_time ? r.checkout_time.slice(0, 5) : '-'}
-                            </td>
-                            <td className="py-3.5 px-4 text-right font-mono tabular-nums">
-                              {r.worked_minutes > 0 ? formatMinutesToHours(r.worked_minutes) : '-'}
-                            </td>
-                            <td className="py-3.5 px-4 text-right font-mono text-xs text-slate-500">
-                              {r.checkin_ip || '-'}
-                            </td>
-                          </tr>
-                        ))}
+                        {historyRows.map((r) => {
+                          const empName = `${r.first_name} ${r.last_name}`;
+                          const hasIn = Boolean(r.has_checkin_photo);
+                          const hasOut = Boolean(r.has_checkout_photo);
+                          return (
+                            <tr key={r.id} className="hover:bg-slate-50">
+                              <td className="py-3.5 px-4 font-medium text-slate-900 capitalize">
+                                {formatFrenchDate(r.work_date)}
+                              </td>
+                              <td className="py-3.5 px-4 font-bold text-slate-900">
+                                {empName}
+                              </td>
+                              <td className="py-3.5 px-4">
+                                {r.is_late === 1 ? (
+                                  <span className="font-semibold text-amber-700">
+                                    En retard ({r.late_minutes} min)
+                                  </span>
+                                ) : (
+                                  <span className="font-semibold text-emerald-700">À l'heure</span>
+                                )}
+                              </td>
+                              <td className="py-3.5 px-4 text-right font-mono tabular-nums">
+                                {r.checkin_time ? r.checkin_time.slice(0, 5) : '-'}
+                              </td>
+                              <td className="py-3.5 px-4 text-right font-mono tabular-nums">
+                                {r.checkout_time ? r.checkout_time.slice(0, 5) : '-'}
+                              </td>
+                              <td className="py-3.5 px-4 text-right font-mono tabular-nums">
+                                {r.worked_minutes > 0 ? formatMinutesToHours(r.worked_minutes) : '-'}
+                              </td>
+                              <td className="py-2.5 px-4">
+                                {hasIn || hasOut ? (
+                                  <div className="flex items-center gap-1.5">
+                                    {hasIn && (
+                                      <ProtectedPhotoThumbnail
+                                        token={token}
+                                        attendanceId={r.id}
+                                        kind="checkin"
+                                        employeeName={empName}
+                                        onOpen={() =>
+                                          setSelectedPhoto({
+                                            attendanceId: r.id,
+                                            kind: 'checkin',
+                                            employeeName: empName,
+                                            dateLabel: formatFrenchDate(r.work_date),
+                                            timeLabel: r.checkin_time ? r.checkin_time.slice(0, 5) : '',
+                                          })
+                                        }
+                                      />
+                                    )}
+                                    {hasOut && (
+                                      <ProtectedPhotoThumbnail
+                                        token={token}
+                                        attendanceId={r.id}
+                                        kind="checkout"
+                                        employeeName={empName}
+                                        onOpen={() =>
+                                          setSelectedPhoto({
+                                            attendanceId: r.id,
+                                            kind: 'checkout',
+                                            employeeName: empName,
+                                            dateLabel: formatFrenchDate(r.work_date),
+                                            timeLabel: r.checkout_time ? r.checkout_time.slice(0, 5) : '',
+                                          })
+                                        }
+                                      />
+                                    )}
+                                  </div>
+                                ) : (
+                                  <span className="text-xs text-slate-400">-</span>
+                                )}
+                              </td>
+                              <td className="py-3.5 px-4 text-right font-mono text-xs text-slate-500">
+                                {r.checkin_ip || '-'}
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -804,6 +917,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           />
         )}
       </div>
+
+      {selectedPhoto && (
+        <ProtectedPhotoModal
+          token={token}
+          photo={selectedPhoto}
+          onClose={() => setSelectedPhoto(null)}
+        />
+      )}
     </div>
   );
 };

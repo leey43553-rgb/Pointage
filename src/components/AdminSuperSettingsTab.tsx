@@ -1,17 +1,30 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   AlertCircle,
+  CalendarOff,
+  Camera,
   Check,
   Database,
   Download,
   KeyRound,
+  Plus,
   Save,
   Trash2,
   Upload,
   Wifi,
 } from 'lucide-react';
-import { ApiError, apiRequest, downloadAuthenticatedFile } from '../api';
-import type { AppSettings } from '../types';
+import { ApiError, apiRequest, downloadAuthenticatedFile, formatFrenchDate } from '../api';
+import type { AppSettings, PhotoRequirement, PublicHolidayEntry } from '../types';
+
+const WEEKDAYS_ORDER: Array<{ day: number; label: string }> = [
+  { day: 0, label: 'Dimanche' },
+  { day: 1, label: 'Lundi' },
+  { day: 2, label: 'Mardi' },
+  { day: 3, label: 'Mercredi' },
+  { day: 4, label: 'Jeudi' },
+  { day: 5, label: 'Vendredi' },
+  { day: 6, label: 'Samedi' },
+];
 
 interface AdminSuperSettingsTabProps {
   token: string;
@@ -29,6 +42,13 @@ export const AdminSuperSettingsTab: React.FC<AdminSuperSettingsTabProps> = ({
   const [officialStartTime, setOfficialStartTime] = useState('09:00');
   const [graceMinutes, setGraceMinutes] = useState(10);
   const [allowedNetworkPrefix, setAllowedNetworkPrefix] = useState('');
+  const [workingDays, setWorkingDays] = useState<number[]>([0, 1, 2, 3, 4]);
+  const [publicHolidays, setPublicHolidays] = useState<PublicHolidayEntry[]>([]);
+  const [newHolidayDate, setNewHolidayDate] = useState('');
+  const [newHolidayType, setNewHolidayType] = useState<'holiday' | 'leave'>('holiday');
+  const [newHolidayLabel, setNewHolidayLabel] = useState('');
+  const [photoRequirement, setPhotoRequirement] = useState<PhotoRequirement>('both');
+  const [photoRetentionDays, setPhotoRetentionDays] = useState(90);
   const [lanIps, setLanIps] = useState<string[]>([]);
   const [clientIp, setClientIp] = useState('');
 
@@ -58,6 +78,18 @@ export const AdminSuperSettingsTab: React.FC<AdminSuperSettingsTabProps> = ({
       setOfficialStartTime(data.settings.official_start_time);
       setGraceMinutes(data.settings.grace_minutes);
       setAllowedNetworkPrefix(data.settings.allowed_network_prefix || '');
+      setWorkingDays(
+        Array.isArray(data.settings.working_days) && data.settings.working_days.length > 0
+          ? data.settings.working_days
+          : [0, 1, 2, 3, 4]
+      );
+      setPublicHolidays(Array.isArray(data.settings.public_holidays) ? data.settings.public_holidays : []);
+      setPhotoRequirement(data.settings.photo_requirement || 'both');
+      setPhotoRetentionDays(
+        typeof data.settings.photo_retention_days === 'number' && data.settings.photo_retention_days > 0
+          ? data.settings.photo_retention_days
+          : 90
+      );
       setLanIps(data.lan_ips || []);
       setClientIp(data.client_ip || '');
     } catch (err) {
@@ -92,6 +124,38 @@ export const AdminSuperSettingsTab: React.FC<AdminSuperSettingsTabProps> = ({
     reader.readAsDataURL(file);
   };
 
+  const toggleWorkingDay = (dayNum: number) => {
+    setWorkingDays((prev) => {
+      if (prev.includes(dayNum)) {
+        if (prev.length <= 1) return prev; // Keep at least 1 working day
+        return prev.filter((d) => d !== dayNum);
+      }
+      return [...prev, dayNum].sort((a, b) => a - b);
+    });
+  };
+
+  const handleAddHoliday = () => {
+    if (!newHolidayDate) return;
+    setError(null);
+    setPublicHolidays((prev) => {
+      const filtered = prev.filter((h) => h.date !== newHolidayDate);
+      return [
+        ...filtered,
+        {
+          date: newHolidayDate,
+          type: newHolidayType,
+          label: newHolidayLabel.trim(),
+        },
+      ].sort((a, b) => a.date.localeCompare(b.date));
+    });
+    setNewHolidayDate('');
+    setNewHolidayLabel('');
+  };
+
+  const handleRemoveHoliday = (dateStr: string) => {
+    setPublicHolidays((prev) => prev.filter((h) => h.date !== dateStr));
+  };
+
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     if (saving) return;
@@ -108,6 +172,10 @@ export const AdminSuperSettingsTab: React.FC<AdminSuperSettingsTabProps> = ({
           official_start_time: officialStartTime,
           grace_minutes: Number(graceMinutes),
           allowed_network_prefix: allowedNetworkPrefix,
+          working_days: workingDays,
+          public_holidays: publicHolidays,
+          photo_requirement: photoRequirement,
+          photo_retention_days: Number(photoRetentionDays),
         },
       });
       setSuccessMsg('Paramètres enregistrés avec succès.');
@@ -277,6 +345,178 @@ export const AdminSuperSettingsTab: React.FC<AdminSuperSettingsTabProps> = ({
             <p className="mt-1 text-xs text-slate-500">
               Exemple : 10 min avec début à 09:00 = retard compté à partir de 09:11.
             </p>
+          </div>
+        </div>
+
+        {/* Working Days & Holidays */}
+        <div className="pt-4 border-t border-slate-200 space-y-5">
+          <div>
+            <h3 className="text-base font-bold text-slate-900 mb-1">
+              Jours travaillés de la semaine
+            </h3>
+            <p className="text-sm text-slate-600 mb-3">
+              Les jours non sélectionnés sont considérés comme week-end et ne comptent pas comme absences dans les rapports Excel.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {WEEKDAYS_ORDER.map(({ day, label }) => {
+                const selected = workingDays.includes(day);
+                return (
+                  <button
+                    key={day}
+                    type="button"
+                    onClick={() => toggleWorkingDay(day)}
+                    className={`min-h-[42px] px-4 py-2 rounded-xl text-sm font-semibold border transition whitespace-nowrap ${
+                      selected
+                        ? 'bg-blue-900 text-white border-blue-900'
+                        : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-100'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div>
+            <div className="flex items-start gap-2.5 mb-2">
+              <CalendarOff className="w-5 h-5 text-blue-800 mt-0.5 shrink-0" />
+              <div>
+                <h3 className="text-base font-bold text-slate-900">
+                  Jours fériés et congés (exclus des absences)
+                </h3>
+                <p className="text-sm text-slate-600">
+                  Ajoutez les jours fériés ou congés collectifs afin qu'ils ne soient pas comptés comme des absences.
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-2.5 items-end mt-3">
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">Date</label>
+                <input
+                  type="date"
+                  value={newHolidayDate}
+                  onChange={(e) => setNewHolidayDate(e.target.value)}
+                  className="w-full min-h-[42px] rounded-xl border border-slate-300 px-3 py-1.5 text-sm font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">Type</label>
+                <select
+                  value={newHolidayType}
+                  onChange={(e) => setNewHolidayType(e.target.value as 'holiday' | 'leave')}
+                  className="w-full min-h-[42px] rounded-xl border border-slate-300 px-3 py-1.5 text-sm bg-white"
+                >
+                  <option value="holiday">Jour férié</option>
+                  <option value="leave">Congé</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">Libellé (optionnel)</label>
+                <input
+                  type="text"
+                  value={newHolidayLabel}
+                  onChange={(e) => setNewHolidayLabel(e.target.value)}
+                  placeholder="ex: Fête nationale"
+                  className="w-full min-h-[42px] rounded-xl border border-slate-300 px-3 py-1.5 text-sm"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={handleAddHoliday}
+                disabled={!newHolidayDate}
+                className="min-h-[42px] inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-300 bg-slate-100 px-4 py-2 text-sm font-bold text-slate-800 hover:bg-slate-200 disabled:opacity-40 whitespace-nowrap"
+              >
+                <Plus className="w-4 h-4" />
+                Ajouter
+              </button>
+            </div>
+
+            {publicHolidays.length > 0 && (
+              <div className="mt-3 rounded-xl border border-slate-200 divide-y divide-slate-200 bg-slate-50">
+                {publicHolidays.map((h) => (
+                  <div
+                    key={h.date}
+                    className="px-4 py-2.5 flex items-center justify-between gap-3 text-sm"
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono font-bold text-slate-900 capitalize">
+                        {formatFrenchDate(h.date)}
+                      </span>
+                      <span aria-hidden="true" className="text-slate-300">·</span>
+                      <span className="font-semibold text-slate-700">
+                        {h.type === 'leave' ? 'Congé' : 'Jour férié'}
+                      </span>
+                      {h.label && (
+                        <>
+                          <span aria-hidden="true" className="text-slate-300">·</span>
+                          <span className="text-slate-600">{h.label}</span>
+                        </>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveHoliday(h.date)}
+                      className="min-h-[36px] inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-semibold text-red-700 hover:bg-red-100"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      Retirer
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Photo Proof Settings */}
+        <div className="pt-4 border-t border-slate-200 space-y-4">
+          <div className="flex items-start gap-3">
+            <Camera className="w-5 h-5 text-blue-800 mt-0.5 shrink-0" />
+            <div>
+              <h3 className="text-base font-bold text-slate-900">
+                Preuve par photo lors du pointage
+              </h3>
+              <p className="text-sm text-slate-600">
+                Les photos sont stockées uniquement sur ce PC dans le dossier <code className="font-mono bg-slate-100 px-1.5 py-0.5 rounded">photos</code> et visibles uniquement par les administrateurs.
+              </p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+            <div>
+              <label className="block text-sm font-semibold text-slate-700 mb-1.5">
+                Photo obligatoire
+              </label>
+              <select
+                value={photoRequirement}
+                onChange={(e) => setPhotoRequirement(e.target.value as PhotoRequirement)}
+                className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm bg-white text-slate-900"
+              >
+                <option value="none">Désactivée</option>
+                <option value="checkin_only">À l'arrivée seulement</option>
+                <option value="both">Arrivée et départ</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-sm font-semibold text-slate-700 mb-1.5">
+                Suppression automatique des photos après (jours)
+              </label>
+              <input
+                type="number"
+                min={1}
+                max={3650}
+                required
+                value={photoRetentionDays}
+                onChange={(e) => setPhotoRetentionDays(Number(e.target.value))}
+                className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm font-mono text-slate-900"
+              />
+              <p className="mt-1 text-xs text-slate-500">
+                Par défaut : 90 jours pour libérer de l'espace disque automatiquement.
+              </p>
+            </div>
           </div>
         </div>
 

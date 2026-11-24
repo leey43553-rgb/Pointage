@@ -2,12 +2,13 @@ import React, { useEffect, useState } from 'react';
 import { AlertCircle, Clock, Delete, Eye, EyeOff, Lock, ShieldCheck } from 'lucide-react';
 import { ApiError, apiRequest } from '../api';
 import { PWAInstallButton } from '../pwa/PWAInstallButton';
-import type { AttendanceRecord, EmployeeProfile, PublicConfig } from '../types';
+import type { AttendanceRecord, EmployeeProfile, PhotoRequirement, PublicConfig } from '../types';
 
 interface EmployeeLoginResponse {
   token: string;
   employee: EmployeeProfile;
   today_attendance: AttendanceRecord | null;
+  photo_requirement?: PhotoRequirement;
   server_time: string;
   server_date: string;
 }
