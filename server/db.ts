@@ -152,7 +152,7 @@ export function initDb(): void {
 
   const adminCount = db.prepare('SELECT COUNT(*) as count FROM admins').get() as { count: number };
   if (adminCount.count === 0) {
-    const defaultPasswordHash = bcrypt.hashSync('change me on first login', 10);
+    const defaultPasswordHash = bcrypt.hashSync('Admin1234', 10);
     db.prepare(
       `INSERT INTO admins (username, password_hash, role, must_change_password, created_at)
        VALUES ('admin', ?, 'super_admin', 1, ?)`

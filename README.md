@@ -58,7 +58,7 @@ Si la connexion depuis les téléphones reste bloquée, créez une règle entran
 1. Sur l'écran d'accueil, cliquez en haut à droite sur **« Espace Responsable »**.
 2. Connectez-vous avec le compte créé automatiquement au premier lancement :
    - **Nom d'utilisateur** : `admin`
-   - **Mot de passe** : `change me on first login`
+   - **Mot de passe** : `Admin1234`
 3. Rendez-vous immédiatement dans l'onglet **Paramètres** pour :
    - Modifier ce mot de passe par défaut.
    - Renseigner le nom de votre entreprise (et votre logo optionnel).
