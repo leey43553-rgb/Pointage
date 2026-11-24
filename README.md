@@ -15,16 +15,15 @@ Ainsi, **les mises à jour et réinstallations ne suppriment jamais vos données
 ## 1. Compiler `Pointage-Setup.exe` sur votre PC
 
 ### Prérequis (une seule fois)
-1. **Node.js LTS (v20 ou v22)** : https://nodejs.org
-2. **Outils de compilation Windows (C++ Build Tools)** si `better-sqlite3` doit être recompilé localement : via l'installeur Node.js (« Automatically install necessary tools ») ou **Visual Studio Build Tools** (*Desktop development with C++*).
+1. **Node.js LTS (v20 ou v22)** : https://nodejs.org  
+*(Aucun outil C++, Visual Studio Build Tools ni Python n'est requis : la base SQLite utilise `node:sqlite` / `sql.js` WebAssembly et le traitement photo est 100 % JavaScript.)*
 
 ### Méthode rapide (1 double-clic)
 Double-cliquez simplement sur **`build-electron.bat`** à la racine du projet.  
 Ce script exécute automatiquement :
 1. `npm install --legacy-peer-deps`
 2. `npm run build`
-3. `npx electron-builder install-app-deps` (recompilation de `better-sqlite3` pour Electron)
-4. `npx electron-builder --win --x64`
+3. `npx electron-builder --win --x64`
 
 ### Méthode en ligne de commande
 ```bat

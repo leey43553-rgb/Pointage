@@ -72,7 +72,7 @@ export async function startServer(options?: {
     process.env.NODE_ENV = 'production';
   }
 
-  initDb();
+  await initDb();
   runPhotoRetentionJob();
   const retentionTimer = setInterval(runPhotoRetentionJob, 6 * 60 * 60 * 1000);
   retentionTimer.unref();
@@ -144,7 +144,7 @@ export async function startServer(options?: {
     console.log(`  Sur les téléphones (Wi-Fi) : http://${ip}:${PORT}`);
   }
   console.log(`  Dossier données : ${DATA_DIR}`);
-  console.log(`  Base SQLite     : ${DB_PATH}`);
+  console.log(`  Base SQLite     : ${DB_PATH} (${db.getEngine()})`);
   console.log(`  Photos          : ${PHOTOS_DIR}`);
   console.log(`  Configuration   : ${CONFIG_PATH}`);
   console.log(`==================================================\n`);

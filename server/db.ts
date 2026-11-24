@@ -1,7 +1,7 @@
-import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -218,11 +218,372 @@ export function updateAppFileConfig(
   return { ...APP_CONFIG };
 }
 
-export const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+type SqlParam = string | number | bigint | Uint8Array | null;
 
-export function initDb(): void {
+export interface DbRunResult {
+  changes: number;
+  lastInsertRowid: number;
+}
+
+export interface DbStatement {
+  get(...params: unknown[]): unknown;
+  all(...params: unknown[]): unknown[];
+  run(...params: unknown[]): DbRunResult;
+}
+
+export type DbEngineName = 'node:sqlite' | 'sql.js (WebAssembly)';
+
+export interface DbAdapter {
+  engine: DbEngineName;
+  prepare(sql: string): DbStatement;
+  exec(sql: string): void;
+  transaction<TArgs extends unknown[], TResult>(
+    fn: (...args: TArgs) => TResult
+  ): (...args: TArgs) => TResult;
+  backup(destPath: string): Promise<void>;
+  close(): void;
+}
+
+function normalizeParam(val: unknown): SqlParam {
+  if (val === undefined || val === null) return null;
+  if (typeof val === 'boolean') return val ? 1 : 0;
+  if (typeof val === 'number' || typeof val === 'string' || typeof val === 'bigint') {
+    return val;
+  }
+  if (val instanceof Uint8Array || Buffer.isBuffer(val)) {
+    return val;
+  }
+  return String(val);
+}
+
+function normalizeParams(params: unknown[]): SqlParam[] {
+  return params.map(normalizeParam);
+}
+
+async function createNodeSqliteAdapter(dbPath: string): Promise<DbAdapter | null> {
+  if (process.env.FORCE_SQLJS === '1') {
+    return null;
+  }
+
+  try {
+    const modName = 'node:sqlite';
+    const sqliteMod = (await import(/* @vite-ignore */ modName)) as {
+      DatabaseSync?: new (location: string) => {
+        exec(sql: string): void;
+        prepare(sql: string): {
+          get(...params: SqlParam[]): unknown;
+          all(...params: SqlParam[]): unknown[];
+          run(...params: SqlParam[]): { changes: number | bigint; lastInsertRowid: number | bigint };
+        };
+        close(): void;
+      };
+    };
+
+    if (!sqliteMod || typeof sqliteMod.DatabaseSync !== 'function') {
+      return null;
+    }
+
+    const DatabaseSyncCtor = sqliteMod.DatabaseSync;
+    // Probe instantiation in memory to confirm SQLite is actually enabled in this runtime
+    const probe = new DatabaseSyncCtor(':memory:');
+    probe.close();
+
+    const nativeDb = new DatabaseSyncCtor(dbPath);
+    try {
+      nativeDb.exec('PRAGMA journal_mode = DELETE;');
+    } catch {
+      // ignore pragma errors
+    }
+    nativeDb.exec('PRAGMA foreign_keys = ON;');
+
+    let txDepth = 0;
+
+    return {
+      engine: 'node:sqlite',
+      prepare(sql: string): DbStatement {
+        const stmt = nativeDb.prepare(sql);
+        return {
+          get(...params: unknown[]) {
+            return stmt.get(...normalizeParams(params));
+          },
+          all(...params: unknown[]) {
+            return stmt.all(...normalizeParams(params));
+          },
+          run(...params: unknown[]): DbRunResult {
+            const res = stmt.run(...normalizeParams(params));
+            return {
+              changes: Number(res.changes ?? 0),
+              lastInsertRowid: Number(res.lastInsertRowid ?? 0),
+            };
+          },
+        };
+      },
+      exec(sql: string): void {
+        nativeDb.exec(sql);
+      },
+      transaction<TArgs extends unknown[], TResult>(fn: (...args: TArgs) => TResult) {
+        return (...args: TArgs): TResult => {
+          const isOuter = txDepth === 0;
+          nativeDb.exec(isOuter ? 'BEGIN IMMEDIATE' : `SAVEPOINT sp_${txDepth}`);
+          txDepth += 1;
+          try {
+            const result = fn(...args);
+            txDepth -= 1;
+            nativeDb.exec(isOuter ? 'COMMIT' : `RELEASE SAVEPOINT sp_${txDepth}`);
+            return result;
+          } catch (err) {
+            txDepth -= 1;
+            try {
+              if (isOuter) {
+                nativeDb.exec('ROLLBACK');
+              } else {
+                nativeDb.exec(`ROLLBACK TO SAVEPOINT sp_${txDepth}`);
+                nativeDb.exec(`RELEASE SAVEPOINT sp_${txDepth}`);
+              }
+            } catch {
+              // ignore rollback errors
+            }
+            throw err;
+          }
+        };
+      },
+      async backup(destPath: string): Promise<void> {
+        if (fs.existsSync(destPath)) {
+          fs.unlinkSync(destPath);
+        }
+        nativeDb.prepare('VACUUM INTO ?').run(destPath);
+      },
+      close(): void {
+        nativeDb.close();
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeSqlJsParams(params: unknown[]): Array<string | number | Uint8Array | null> {
+  return params.map((val) => {
+    if (val === undefined || val === null) return null;
+    if (typeof val === 'boolean') return val ? 1 : 0;
+    if (typeof val === 'number' || typeof val === 'string') return val;
+    if (typeof val === 'bigint') {
+      return val >= BigInt(Number.MIN_SAFE_INTEGER) && val <= BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number(val)
+        : val.toString();
+    }
+    if (val instanceof Uint8Array || Buffer.isBuffer(val)) return val;
+    return String(val);
+  });
+}
+
+async function createSqlJsAdapter(dbPath: string): Promise<DbAdapter> {
+  const req = createRequire(import.meta.url);
+  let wasmPath = req.resolve('sql.js/dist/sql-wasm.wasm');
+  const unpackedWasmPath = wasmPath.replace('app.asar', 'app.asar.unpacked');
+  if (fs.existsSync(unpackedWasmPath)) {
+    wasmPath = unpackedWasmPath;
+  }
+  const wasmBinary = fs.readFileSync(wasmPath);
+
+  const { default: initSqlJs } = await import('sql.js');
+  const SQL = await initSqlJs({
+    wasmBinary: wasmBinary.buffer.slice(
+      wasmBinary.byteOffset,
+      wasmBinary.byteOffset + wasmBinary.byteLength
+    ),
+  });
+
+  let nativeDb: InstanceType<typeof SQL.Database>;
+  if (fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0) {
+    const fileBuf = fs.readFileSync(dbPath);
+    // Patch legacy WAL header flags (bytes 18-19 = 2) in memory so sql.js opens older DBs cleanly
+    if (fileBuf.length >= 20 && (fileBuf[18] === 2 || fileBuf[19] === 2)) {
+      fileBuf[18] = 1;
+      fileBuf[19] = 1;
+    }
+    nativeDb = new SQL.Database(fileBuf);
+  } else {
+    nativeDb = new SQL.Database();
+  }
+
+  nativeDb.run('PRAGMA foreign_keys = ON;');
+
+  let txDepth = 0;
+  let dirty = false;
+
+  const persistToDisk = () => {
+    const data = nativeDb.export();
+    const buf = Buffer.from(data);
+    const tmpPath = `${dbPath}.tmp`;
+    try {
+      fs.writeFileSync(tmpPath, buf);
+      fs.renameSync(tmpPath, dbPath);
+    } catch {
+      fs.writeFileSync(dbPath, buf);
+      try {
+        if (fs.existsSync(tmpPath)) {
+          fs.unlinkSync(tmpPath);
+        }
+      } catch {
+        // ignore cleanup error
+      }
+    }
+    dirty = false;
+  };
+
+  if (!fs.existsSync(dbPath)) {
+    persistToDisk();
+  }
+
+  return {
+    engine: 'sql.js (WebAssembly)',
+    prepare(sql: string): DbStatement {
+      return {
+        get(...params: unknown[]) {
+          const stmt = nativeDb.prepare(sql);
+          try {
+            const bound = normalizeSqlJsParams(params);
+            if (bound.length > 0) stmt.bind(bound);
+            if (stmt.step()) {
+              return stmt.getAsObject();
+            }
+            return undefined;
+          } finally {
+            stmt.free();
+          }
+        },
+        all(...params: unknown[]) {
+          const stmt = nativeDb.prepare(sql);
+          try {
+            const bound = normalizeSqlJsParams(params);
+            if (bound.length > 0) stmt.bind(bound);
+            const rows: Array<Record<string, unknown>> = [];
+            while (stmt.step()) {
+              rows.push(stmt.getAsObject());
+            }
+            return rows;
+          } finally {
+            stmt.free();
+          }
+        },
+        run(...params: unknown[]): DbRunResult {
+          const stmt = nativeDb.prepare(sql);
+          try {
+            const bound = normalizeSqlJsParams(params);
+            if (bound.length > 0) stmt.bind(bound);
+            stmt.step();
+          } finally {
+            stmt.free();
+          }
+          const changes = nativeDb.getRowsModified();
+          let lastInsertRowid = 0;
+          const res = nativeDb.exec('SELECT last_insert_rowid()');
+          if (res.length > 0 && res[0].values.length > 0) {
+            lastInsertRowid = Number(res[0].values[0][0] ?? 0);
+          }
+          dirty = true;
+          if (txDepth === 0) {
+            persistToDisk();
+          }
+          return { changes, lastInsertRowid };
+        },
+      };
+    },
+    exec(sql: string): void {
+      nativeDb.exec(sql);
+      dirty = true;
+      if (txDepth === 0) {
+        persistToDisk();
+      }
+    },
+    transaction<TArgs extends unknown[], TResult>(fn: (...args: TArgs) => TResult) {
+      return (...args: TArgs): TResult => {
+        const isOuter = txDepth === 0;
+        nativeDb.run(isOuter ? 'BEGIN IMMEDIATE' : `SAVEPOINT sp_${txDepth}`);
+        txDepth += 1;
+        try {
+          const result = fn(...args);
+          txDepth -= 1;
+          if (isOuter) {
+            nativeDb.run('COMMIT');
+            if (dirty) {
+              persistToDisk();
+            }
+          } else {
+            nativeDb.run(`RELEASE SAVEPOINT sp_${txDepth}`);
+          }
+          return result;
+        } catch (err) {
+          txDepth -= 1;
+          try {
+            if (isOuter) {
+              nativeDb.run('ROLLBACK');
+              dirty = false;
+            } else {
+              nativeDb.run(`ROLLBACK TO SAVEPOINT sp_${txDepth}`);
+              nativeDb.run(`RELEASE SAVEPOINT sp_${txDepth}`);
+            }
+          } catch {
+            // ignore rollback error
+          }
+          throw err;
+        }
+      };
+    },
+    async backup(destPath: string): Promise<void> {
+      fs.writeFileSync(destPath, Buffer.from(nativeDb.export()));
+    },
+    close(): void {
+      if (dirty) {
+        persistToDisk();
+      }
+      nativeDb.close();
+    },
+  };
+}
+
+let activeBackend: DbAdapter | null = null;
+
+function requireBackend(): DbAdapter {
+  if (!activeBackend) {
+    throw new Error("La base de données n'est pas initialisée. Appelez initDb() d'abord.");
+  }
+  return activeBackend;
+}
+
+export const db = {
+  getEngine(): DbEngineName {
+    return requireBackend().engine;
+  },
+  prepare(sql: string): DbStatement {
+    return requireBackend().prepare(sql);
+  },
+  exec(sql: string): void {
+    requireBackend().exec(sql);
+  },
+  transaction<TArgs extends unknown[], TResult>(
+    fn: (...args: TArgs) => TResult
+  ): (...args: TArgs) => TResult {
+    return requireBackend().transaction(fn);
+  },
+  backup(destPath: string): Promise<void> {
+    return requireBackend().backup(destPath);
+  },
+  close(): void {
+    if (activeBackend) {
+      activeBackend.close();
+      activeBackend = null;
+    }
+  },
+};
+
+export async function initDb(): Promise<void> {
+  if (!activeBackend) {
+    activeBackend =
+      (await createNodeSqliteAdapter(DB_PATH)) ?? (await createSqlJsAdapter(DB_PATH));
+  }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS settings (
       id INTEGER PRIMARY KEY CHECK (id = 1),
