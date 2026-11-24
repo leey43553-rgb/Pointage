@@ -5,10 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "start": "vite build && node server.ts --prod",
-    "build": "vite build",
+    "start": "node server.js",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=esm --packages=external --define:__PROD_BUNDLE__=true --outfile=server.js",
     "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
+    "clean": "rm -rf dist server.js build-stage installer-output",
     "lint": "tsc --noEmit"
   },
   "dependencies": {

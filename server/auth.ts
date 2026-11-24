@@ -1,8 +1,8 @@
 import crypto from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
-import { db, type AdminRow, type EmployeeRow } from './db.ts';
+import { APP_CONFIG, db, type AdminRow, type EmployeeRow } from './db.ts';
 
-const TOKEN_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const TOKEN_SECRET = process.env.SESSION_SECRET || APP_CONFIG.sessionSecret;
 
 export interface AdminTokenPayload {
   sub: number;

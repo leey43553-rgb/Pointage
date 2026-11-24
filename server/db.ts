@@ -1,8 +1,15 @@
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+export interface AppFileConfig {
+  port: number;
+  host: string;
+  sessionSecret: string;
+}
 
 export interface PublicHolidayEntry {
   date: string;
@@ -79,9 +86,85 @@ export function getLocalDateTimeIso(date: Date = new Date()): string {
   return `${getLocalDateString(date)}T${getLocalTimeString(date)}`;
 }
 
-const APP_ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-export const DB_PATH = path.join(APP_ROOT_DIR, 'pointage.db');
-export const PHOTOS_DIR = path.join(APP_ROOT_DIR, 'photos');
+const currentFileDir = path.dirname(fileURLToPath(import.meta.url));
+export const APP_ROOT_DIR =
+  path.basename(currentFileDir) === 'server'
+    ? path.resolve(currentFileDir, '..')
+    : currentFileDir;
+
+const DEFAULT_DATA_DIR =
+  process.platform === 'win32'
+    ? 'C:\\ProgramData\\Pointage'
+    : path.join(APP_ROOT_DIR, 'data');
+
+const envDataDir = process.env.DATA_DIR ? process.env.DATA_DIR.trim() : '';
+export const DATA_DIR = path.resolve(envDataDir || DEFAULT_DATA_DIR);
+export const DB_PATH = path.join(DATA_DIR, 'pointage.db');
+export const PHOTOS_DIR = path.join(DATA_DIR, 'photos');
+export const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
+
+fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(PHOTOS_DIR, { recursive: true });
+
+function loadOrCreateAppConfig(): AppFileConfig {
+  let parsed: Partial<AppFileConfig> = {};
+  let needsWrite = false;
+
+  if (fs.existsSync(CONFIG_PATH)) {
+    try {
+      const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
+      const obj = JSON.parse(raw) as unknown;
+      if (obj && typeof obj === 'object') {
+        parsed = obj as Partial<AppFileConfig>;
+      } else {
+        needsWrite = true;
+      }
+    } catch {
+      needsWrite = true;
+    }
+  } else {
+    needsWrite = true;
+  }
+
+  const port =
+    typeof parsed.port === 'number' && Number.isInteger(parsed.port) && parsed.port > 0 && parsed.port < 65536
+      ? parsed.port
+      : 3000;
+  if (port !== parsed.port) needsWrite = true;
+
+  const host =
+    typeof parsed.host === 'string' && parsed.host.trim()
+      ? parsed.host.trim()
+      : '0.0.0.0';
+  if (host !== parsed.host) needsWrite = true;
+
+  const sessionSecret =
+    typeof parsed.sessionSecret === 'string' && parsed.sessionSecret.length >= 32
+      ? parsed.sessionSecret
+      : crypto.randomBytes(32).toString('hex');
+  if (sessionSecret !== parsed.sessionSecret) needsWrite = true;
+
+  const config: AppFileConfig = {
+    port,
+    host,
+    sessionSecret,
+  };
+
+  if (needsWrite) {
+    try {
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + '\n', {
+        encoding: 'utf8',
+        mode: 0o600,
+      });
+    } catch {
+      // Ignore write error if config file is read-only
+    }
+  }
+
+  return config;
+}
+
+export const APP_CONFIG = loadOrCreateAppConfig();
 
 export const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');

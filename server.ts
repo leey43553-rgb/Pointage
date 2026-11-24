@@ -3,13 +3,25 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DB_PATH, db, initDb, type SettingsRow } from './server/db.ts';
+import {
+  APP_CONFIG,
+  CONFIG_PATH,
+  DATA_DIR,
+  DB_PATH,
+  PHOTOS_DIR,
+  db,
+  initDb,
+  type SettingsRow,
+} from './server/db.ts';
 import { cleanupOldPhotos } from './server/photos.ts';
 import { createApiRouter, getServerLanIps } from './server/routes.ts';
 
-const PORT = Number(process.env.PORT) || 3000;
-const HOST = '0.0.0.0';
+declare const __PROD_BUNDLE__: boolean | undefined;
+
+const PORT = Number(process.env.PORT) || APP_CONFIG.port || 3000;
+const HOST = process.env.HOST || APP_CONFIG.host || '0.0.0.0';
 const APP_ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const ENTRY_FILENAME = path.basename(fileURLToPath(import.meta.url));
 
 function runPhotoRetentionJob(): void {
   try {
@@ -23,8 +35,13 @@ function runPhotoRetentionJob(): void {
 }
 
 async function startServer() {
+  const isCompiledBundle =
+    (typeof __PROD_BUNDLE__ !== 'undefined' && __PROD_BUNDLE__) || ENTRY_FILENAME === 'server.js';
   const isProdMode =
-    process.env.NODE_ENV === 'production' || process.argv.includes('--prod');
+    isCompiledBundle ||
+    process.env.NODE_ENV === 'production' ||
+    process.argv.includes('--prod');
+
   if (isProdMode && !process.env.NODE_ENV) {
     process.env.NODE_ENV = 'production';
   }
@@ -47,7 +64,7 @@ async function startServer() {
   if (isProdMode) {
     if (!fs.existsSync(distIndex)) {
       throw new Error(
-        'Le dossier "dist" est introuvable. Exécutez "npm run build" ou "npm start" pour compiler le frontend.'
+        'Le dossier "dist" est introuvable. Exécutez "npm run build" pour compiler le frontend.'
       );
     }
     app.use(
@@ -63,7 +80,7 @@ async function startServer() {
       res.setHeader('Cache-Control', 'no-cache');
       res.sendFile(distIndex);
     });
-  } else {
+  } else if (!(typeof __PROD_BUNDLE__ !== 'undefined' && __PROD_BUNDLE__)) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
@@ -78,13 +95,16 @@ async function startServer() {
   httpServer.listen(PORT, HOST, () => {
     console.log(`\n==================================================`);
     console.log(`  Pointage Entreprise (${isProdMode ? 'Production' : 'Développement'})`);
-    console.log(`  Écoute sur : http://${HOST}:${PORT}`);
-    console.log(`  Sur ce PC  : http://localhost:${PORT}`);
+    console.log(`  Écoute sur  : http://${HOST}:${PORT}`);
+    console.log(`  Sur ce PC   : http://localhost:${PORT}`);
     const lanIps = getServerLanIps();
     for (const ip of lanIps) {
       console.log(`  Sur les téléphones (Wi-Fi) : http://${ip}:${PORT}`);
     }
-    console.log(`  Base SQLite : ${DB_PATH}`);
+    console.log(`  Dossier données : ${DATA_DIR}`);
+    console.log(`  Base SQLite     : ${DB_PATH}`);
+    console.log(`  Photos          : ${PHOTOS_DIR}`);
+    console.log(`  Configuration   : ${CONFIG_PATH}`);
     console.log(`==================================================\n`);
   });
 }

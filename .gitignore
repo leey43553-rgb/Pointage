@@ -2,6 +2,13 @@ node_modules/
 build/
 dist/
 coverage/
+data/
+photos/
+pointage.db*
+server.js
+build-cache/
+build-stage/
+installer-output/
 .DS_Store
 *.log
 .env*

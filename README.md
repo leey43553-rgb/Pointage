@@ -1,103 +1,101 @@
-# Pointage Entreprise — Application locale de gestion des présences
+# Pointage Entreprise — Installation sur Serveur Windows (Service + Installateur `Setup.exe`)
 
-Application complète de pointage (employés et responsables) fonctionnant **100 % en local sur un PC Windows**, sans aucun service cloud ni abonnement. Toutes les données sont enregistrées dans un fichier local nommé **`pointage.db`** créé automatiquement à côté de l'application, et les photos de présence sont enregistrées localement dans le dossier **`photos/`**.
+Application complète de pointage (employés et responsables) fonctionnant **100 % en local sur Windows**, en tant que **service Windows natif (`Pointage`)** sans aucune fenêtre de commande ni installation manuelle de Node.js sur le serveur.
+
+Toutes les données persistantes sont stockées séparément du logiciel dans le dossier défini par `DATA_DIR` (par défaut **`C:\ProgramData\Pointage`**) :
+- `pointage.db` : base SQLite des employés, responsables et pointages
+- `photos/` : photos de présence (organisées par date et employé)
+- `config.json` : configuration serveur (`port`, `host`, secret de session persistant)
+- `logs/` : journaux du service Windows
+
+Ainsi, **les mises à jour ne suppriment jamais vos données**.
 
 ---
 
-## 1. Installation et lancement rapide sur Windows
+## 1. Générer `Setup.exe` sur votre PC de développement
 
-### Étape 1 : Installer Node.js
-1. Rendez-vous sur le site officiel : **https://nodejs.org**
-2. Téléchargez et installez la version **LTS** (v22 ou plus récent) pour Windows en cliquant sur « Suivant » jusqu'à la fin.
-3. Redémarrez le PC si demandé.
+### Prérequis sur votre PC (une seule fois)
+1. **Node.js LTS (v22 ou plus)** : https://nodejs.org
+2. **Inno Setup 6** : https://jrsoftware.org/isdl.php (cochez *Preprocess / Command Line Compiler* lors de l'installation)
 
-### Étape 2 : Démarrer en un double-clic (`start.bat`)
-1. Ouvrez le dossier de l'application.
-2. Double-cliquez simplement sur le fichier **`start.bat`**.
-3. Lors du tout premier lancement, `start.bat` installe automatiquement les dépendances (`npm install` avec la configuration `.npmrc` déjà incluse), compile l'interface, crée la base `pointage.db` et le dossier `photos/` à côté de l'application, et démarre le serveur en **mode production** sur `0.0.0.0:3000`.
+### Commandes à exécuter pour produire `Setup.exe`
 
-> **Important** : laissez la fenêtre noire ouverte tant que les employés utilisent le pointage. Pour arrêter le serveur, fermez simplement cette fenêtre (ou appuyez sur `Ctrl + C`).
+Ouvrez PowerShell ou l'Invite de commandes (`cmd`) dans le dossier du projet et exécutez :
 
-### Méthode manuelle (en ligne de commande)
-Si vous préférez utiliser l'Invite de commandes (`cmd`) ou PowerShell dans le dossier du projet :
-
-```bash
+```bat
 npm install
-npm start
+npm run build
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\prepare-windows-bundle.ps1
 ```
 
-*(En cas d'erreur de dépendances sur une ancienne version de npm, exécutez `npm install --legacy-peer-deps`.)*
+*(Ou double-cliquez simplement sur **`prepare-installer.bat`**, qui enchaîne automatiquement toutes les étapes.)*
 
-`npm start` compile automatiquement l'application frontend (`dist/`) puis lance le serveur en mode production sur `http://0.0.0.0:3000`.
+Si Inno Setup est installé dans un dossier personnalisé, lancez ensuite :
+```bat
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+```
 
----
-
-## 2. Ouvrir l'application depuis les téléphones (Wi-Fi)
-
-Au démarrage, le serveur affiche directement dans la fenêtre les adresses exactes à saisir sur les téléphones, par exemple :
-- Sur ce PC : `http://localhost:3000`
-- Sur les téléphones (Wi-Fi) : `http://192.168.1.25:3000`
-
-1. Vérifiez que le PC Windows et les téléphones sont connectés au **même réseau Wi-Fi** de l'entreprise.
-2. Sur le téléphone d'un employé (Android ou iPhone), ouvrez le navigateur (Chrome ou Safari) et tapez l'adresse affichée dans la console :
-   ```text
-   http://IP-DU-PC:3000
-   ```
-   *(Si besoin, vous pouvez retrouver l'IP du PC en tapant `ipconfig` dans `cmd`, ligne **Adresse IPv4**.)*
-
-### Installer l'application sur l'écran d'accueil du téléphone (PWA)
-- **Sur Android (Chrome)** : appuyez sur **« Installer sur le téléphone »** en bas de l'écran (ou menu `⋮` → *Ajouter à l'écran d'accueil*).
-- **Sur iPhone / iPad (Safari)** : appuyez sur **Partager** puis sur **« Sur l'écran d'accueil »**.
-
-### Autoriser le port 3000 dans le Pare-feu Windows (si les téléphones ne chargent pas la page)
-La première fois, Windows affiche une alerte Pare-feu pour Node.js : cochez **Réseaux privés** et cliquez sur **Autoriser l'accès**.  
-Si la connexion depuis les téléphones reste bloquée, créez une règle entrante TCP sur le port **3000** dans le Pare-feu Windows Defender.
+Ce processus :
+1. Compile l'interface React (`dist/`) et le serveur de production (`server.js`).
+2. Télécharge et met en cache **Node.js portable (Windows x64)** et **WinSW (Windows Service Wrapper)** dans `build-cache/`.
+3. Assemble le dossier `build-stage/` avec uniquement les dépendances de production compilées pour ce Node.js portable.
+4. Génère l'installateur prêt à copier sur le serveur : **`installer-output\Setup.exe`**.
 
 ---
 
-## 3. Première connexion (Super Administrateur)
+## 2. Installer sur le serveur Windows (sans Node.js ni console)
 
-1. Sur l'écran d'accueil, cliquez en haut à droite sur **« Espace Responsable »**.
-2. Connectez-vous avec le compte créé automatiquement au premier lancement :
-   - **Nom d'utilisateur** : `admin`
-   - **Mot de passe** : `Admin1234`
-3. Rendez-vous immédiatement dans l'onglet **Paramètres** pour :
-   - Modifier ce mot de passe par défaut.
-   - Renseigner le nom de votre entreprise (et votre logo optionnel).
-   - Régler l'heure officielle d'arrivée, la tolérance de retard, les **jours travaillés de la semaine** (par défaut : dimanche à jeudi) et les **jours fériés / congés** à exclure des absences.
-   - Choisir l'option **Photo obligatoire** (`Désactivée`, `À l'arrivée seulement`, ou `Arrivée et départ`) et la durée de conservation automatique des photos (par défaut **90 jours**).
-   - *(Optionnel)* Renseigner le préfixe **Réseau autorisé** (ex. `192.168.1.`) pour empêcher le pointage depuis l'extérieur du Wi-Fi de l'entreprise.
+1. Copiez **`Setup.exe`** sur le serveur Windows.
+2. Double-cliquez sur **`Setup.exe`** et acceptez l'élévation Administrateur (UAC).
+3. L'installateur effectue automatiquement toutes les opérations suivantes :
+   - Installe l'application et le runtime Node.js portable dans **`C:\Program Files\Pointage`**.
+   - Crée le dossier de données **`C:\ProgramData\Pointage`** (`photos/` et `logs/`).
+   - Ouvre le **port TCP 3000** dans le Pare-feu Windows (`Pointage (Port 3000)`).
+   - Installe et démarre le service Windows nommé **`Pointage`** (démarrage automatique avec Windows et redémarrage automatique en cas d'incident).
+   - Crée le raccourci **`Pointage Admin`** sur le Bureau qui ouvre `http://localhost:3000`.
+4. Double-cliquez sur **`Pointage Admin`** sur le Bureau : aucune fenêtre noire ne s'ouvre.
 
----
+### Première connexion (Super Administrateur)
+- Cliquez sur **« Espace Responsable »** en haut à droite :
+  - **Nom d'utilisateur** : `admin`
+  - **Mot de passe** : `Admin1234`
+- Rendez-vous immédiatement dans **Paramètres** pour changer ce mot de passe, configurer votre entreprise, les jours travaillés, les jours fériés et l'option photo.
 
-## 4. Preuve par photo (compatible HTTP local)
-
-- Lorsqu'une photo est demandée, l'employé appuie sur **« Je suis arrivé »** (ou **« Je pars »**), puis sur **« Prendre une photo »** : la caméra frontale du téléphone s'ouvre directement, sans nécessiter HTTPS.
-- L'image est automatiquement compressée dans le navigateur (largeur max 800 px, JPEG sous 150 Ko) puis affichée avec deux grands boutons : **« Envoyer »** (vert) et **« Reprendre »** (gris). Le pointage n'est enregistré qu'après validation.
-- Les photos sont enregistrées dans le dossier **`photos/AAAA-MM-JJ/emp-ID/`** sur le PC et ne sont accessibles que par les administrateurs connectés (aucune URL publique).
-- Un nettoyage automatique supprime les photos plus anciennes que le nombre de jours configuré dans **Paramètres**.
-
----
-
-## 5. Rapport Excel (`.xlsx`) et rôles
-
-- **Employé** : saisit uniquement son **code personnel à 6 chiffres** sur le grand clavier tactile, puis pointe son arrivée et son départ. Déconnexion automatique après 30 secondes d'inactivité.
-- **Admin** : consulte les présences du jour (avec miniatures des photos cliquables), l'historique, et génère le rapport **Excel (`.xlsx`)** dans **Bilan mensuel** :
-  - **1er onglet « Résumé »** (lorsque « Tous les employés » est sélectionné) : synthèse mensuelle complète par employé.
-  - **1 onglet par employé** : détail jour par jour du mois (Présent / En retard / Absent / Week-end / Jour férié / Congé / Départ non pointé), présence des photos (`Oui` / `Non`) et totaux mensuels, mis en page en A4 paysage prêt à imprimer (`Rapport-pointage-AAAA-MM.xlsx`).
-- **Super Admin (Patron)** : accès complet (gestion des employés et des admins, impression des codes, paramètres, et sauvegarde de `pointage.db`).
+### Accès depuis les téléphones (Wi-Fi de l'entreprise)
+Sur les téléphones Android ou iPhone connectés au même réseau Wi-Fi, ouvrez :
+```text
+http://IP-DU-SERVEUR:3000
+```
+L'application s'installe sur l'écran d'accueil en tant que **PWA** (*Ajouter à l'écran d'accueil*).
 
 ---
 
-## 6. Base de données et sauvegarde (`pointage.db`)
+## 3. Mettre à jour l'application sans perdre les données
 
-Le fichier **`pointage.db`** et le dossier **`photos/`** sont stockés directement dans le dossier de l'application, à côté de `start.bat` et `server.ts`.  
-Dans l'onglet **Paramètres**, le bouton **« Sauvegarder (pointage.db) »** permet de télécharger à tout moment une copie complète de la base de données.
+Lorsqu'une nouvelle version est prête (`Setup.exe` recompilé) :
+1. Copiez le nouveau **`Setup.exe`** sur le serveur et lancez-le directement (**ne désinstallez pas manuellement**, ou même si vous désinstallez, `C:\ProgramData\Pointage` est conservé).
+2. `Setup.exe` arrête automatiquement le service `Pointage`, remplace uniquement les fichiers de programme dans `C:\Program Files\Pointage`, puis redémarre le service.
+3. Vos fichiers `pointage.db`, `photos/` et `config.json` dans `C:\ProgramData\Pointage` restent **100 % intacts**.
+
+### Changer l'emplacement des données (`DATA_DIR`)
+Si vous souhaitez stocker les données sur un autre disque (ex. `D:\DonneesPointage`) :
+1. Définissez la variable d'environnement système Windows `DATA_DIR=D:\DonneesPointage`.
+2. Arrêtez le service `Pointage`, copiez le contenu de `C:\ProgramData\Pointage` vers `D:\DonneesPointage`, puis redémarrez le service `Pointage` depuis `services.msc`.
 
 ---
 
-## 7. Dépendances principales ajoutées
+## 4. Gestion manuelle du service Windows (optionnel)
 
-- `exceljs` : génération des rapports Excel `.xlsx` multi-onglets et mise en forme.
-- `multer` et `@types/multer` : réception sécurisée des photos envoyées lors du pointage.
-- `better-sqlite3`, `bcryptjs`, `vite-plugin-pwa` : base SQLite locale, hachage sécurisé des mots de passe et support PWA.
+Les scripts suivants (dans `service/` ou `C:\Program Files\Pointage\`) permettent de gérer le service manuellement en tant qu'administrateur :
+- **`install-service.bat`** : installe et démarre le service `Pointage` (démarrage auto + relance sur échec + règle Pare-feu).
+- **`uninstall-service.bat`** : arrête et supprime le service `Pointage` sans toucher aux données.
+- **Lancement ponctuel en console** : `npm run build` puis `node server.js` (écoute sur `0.0.0.0:3000`).
+
+---
+
+## 5. Dépendances principales
+
+- `exceljs` : export mensuel Excel `.xlsx` multi-onglets.
+- `multer` et `@types/multer` : réception sécurisée des photos de présence.
+- `better-sqlite3`, `bcryptjs`, `vite-plugin-pwa` : SQLite local, hachage des mots de passe et PWA.
+- **WinSW v2.12** et **Inno Setup 6** : exécution en service Windows et création de `Setup.exe`.
