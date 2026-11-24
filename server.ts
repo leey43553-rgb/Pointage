@@ -11,10 +11,18 @@ import {
   PHOTOS_DIR,
   db,
   initDb,
+  updateAppFileConfig,
   type SettingsRow,
 } from './server/db.ts';
 import { cleanupOldPhotos } from './server/photos.ts';
-import { createApiRouter, getServerLanIps } from './server/routes.ts';
+import {
+  createApiRouter,
+  getPrimaryLanIp,
+  getServerLanIps,
+  type DesktopHooks,
+} from './server/routes.ts';
+
+export { APP_CONFIG, DATA_DIR, updateAppFileConfig };
 
 declare const __PROD_BUNDLE__: boolean | undefined;
 
@@ -34,13 +42,31 @@ function runPhotoRetentionJob(): void {
   }
 }
 
-async function startServer() {
+export interface StartedPointageServer {
+  httpServer: http.Server;
+  app: express.Express;
+  port: number;
+  host: string;
+  lanIps: string[];
+  primaryLanIp: string;
+  dataDir: string;
+  dbPath: string;
+  photosDir: string;
+  configPath: string;
+  closeServer: () => Promise<void>;
+}
+
+export async function startServer(options?: {
+  prodMode?: boolean;
+  desktopHooks?: DesktopHooks;
+}): Promise<StartedPointageServer> {
   const isCompiledBundle =
     (typeof __PROD_BUNDLE__ !== 'undefined' && __PROD_BUNDLE__) || ENTRY_FILENAME === 'server.js';
   const isProdMode =
-    isCompiledBundle ||
-    process.env.NODE_ENV === 'production' ||
-    process.argv.includes('--prod');
+    options?.prodMode ??
+    (isCompiledBundle ||
+      process.env.NODE_ENV === 'production' ||
+      process.argv.includes('--prod'));
 
   if (isProdMode && !process.env.NODE_ENV) {
     process.env.NODE_ENV = 'production';
@@ -48,13 +74,14 @@ async function startServer() {
 
   initDb();
   runPhotoRetentionJob();
-  setInterval(runPhotoRetentionJob, 6 * 60 * 60 * 1000).unref();
+  const retentionTimer = setInterval(runPhotoRetentionJob, 6 * 60 * 60 * 1000);
+  retentionTimer.unref();
 
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
   // Mount API routes
-  app.use('/api', createApiRouter());
+  app.use('/api', createApiRouter(options?.desktopHooks));
 
   const httpServer = http.createServer(app);
 
@@ -92,24 +119,77 @@ async function startServer() {
     app.use(vite.middlewares);
   }
 
-  httpServer.listen(PORT, HOST, () => {
-    console.log(`\n==================================================`);
-    console.log(`  Pointage Entreprise (${isProdMode ? 'Production' : 'Développement'})`);
-    console.log(`  Écoute sur  : http://${HOST}:${PORT}`);
-    console.log(`  Sur ce PC   : http://localhost:${PORT}`);
-    const lanIps = getServerLanIps();
-    for (const ip of lanIps) {
-      console.log(`  Sur les téléphones (Wi-Fi) : http://${ip}:${PORT}`);
-    }
-    console.log(`  Dossier données : ${DATA_DIR}`);
-    console.log(`  Base SQLite     : ${DB_PATH}`);
-    console.log(`  Photos          : ${PHOTOS_DIR}`);
-    console.log(`  Configuration   : ${CONFIG_PATH}`);
-    console.log(`==================================================\n`);
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: NodeJS.ErrnoException) => {
+      httpServer.off('listening', onListening);
+      reject(err);
+    };
+    const onListening = () => {
+      httpServer.off('error', onError);
+      resolve();
+    };
+    httpServer.once('error', onError);
+    httpServer.once('listening', onListening);
+    httpServer.listen(PORT, HOST);
   });
+
+  const lanIps = getServerLanIps();
+  const primaryLanIp = getPrimaryLanIp();
+
+  console.log(`\n==================================================`);
+  console.log(`  Pointage Entreprise (${isProdMode ? 'Production' : 'Développement'})`);
+  console.log(`  Écoute sur  : http://${HOST}:${PORT}`);
+  console.log(`  Sur ce PC   : http://localhost:${PORT}`);
+  for (const ip of lanIps) {
+    console.log(`  Sur les téléphones (Wi-Fi) : http://${ip}:${PORT}`);
+  }
+  console.log(`  Dossier données : ${DATA_DIR}`);
+  console.log(`  Base SQLite     : ${DB_PATH}`);
+  console.log(`  Photos          : ${PHOTOS_DIR}`);
+  console.log(`  Configuration   : ${CONFIG_PATH}`);
+  console.log(`==================================================\n`);
+
+  const closeServer = async () => {
+    clearInterval(retentionTimer);
+    await new Promise<void>((resolve) => {
+      httpServer.close(() => resolve());
+    });
+    try {
+      db.close();
+    } catch {
+      // ignore if already closed
+    }
+  };
+
+  return {
+    httpServer,
+    app,
+    port: PORT,
+    host: HOST,
+    lanIps,
+    primaryLanIp,
+    dataDir: DATA_DIR,
+    dbPath: DB_PATH,
+    photosDir: PHOTOS_DIR,
+    configPath: CONFIG_PATH,
+    closeServer,
+  };
 }
 
-startServer().catch((err) => {
-  console.error('Erreur au démarrage du serveur :', err);
-  process.exit(1);
-});
+const isDirectEntry =
+  process.env.POINTAGE_ELECTRON !== '1' &&
+  Boolean(process.argv[1]) &&
+  path.resolve(fileURLToPath(import.meta.url)) === path.resolve(process.argv[1]);
+
+if (isDirectEntry) {
+  startServer().catch((err: NodeJS.ErrnoException) => {
+    if (err?.code === 'EADDRINUSE') {
+      console.error(
+        `Erreur : le port ${PORT} est déjà occupé par une autre application. Fermez-la puis réessayez.`
+      );
+    } else {
+      console.error('Erreur au démarrage du serveur :', err);
+    }
+    process.exit(1);
+  });
+}

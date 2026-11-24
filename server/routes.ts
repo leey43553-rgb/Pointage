@@ -15,11 +15,17 @@ import {
   type AuthenticatedRequest,
 } from './auth.ts';
 import {
+  APP_CONFIG,
+  CONFIG_PATH,
+  DATA_DIR,
+  DB_PATH,
+  PHOTOS_DIR,
   db,
   generateUniqueEmployeeCode,
   getLocalDateString,
   getLocalDateTimeIso,
   getLocalTimeString,
+  updateAppFileConfig,
   type AdminRow,
   type AttendanceRow,
   type EmployeeRow,
@@ -82,6 +88,26 @@ export function getServerLanIps(): string[] {
     }
   }
   return ips;
+}
+
+export function getPrimaryLanIp(): string {
+  const ips = getServerLanIps();
+  const preferred =
+    ips.find((ip) => ip.startsWith('192.168.')) ||
+    ips.find((ip) => ip.startsWith('10.')) ||
+    ips.find((ip) => /^172\.(1[6-9]|2\d|3[01])\./.test(ip)) ||
+    ips[0];
+  return preferred || 'localhost';
+}
+
+export interface DesktopHooks {
+  isElectron: boolean;
+  getDesktopSettings: () => { openAtLogin: boolean; startMinimized: boolean };
+  setDesktopSettings: (opts: {
+    openAtLogin?: boolean;
+    startMinimized?: boolean;
+  }) => { openAtLogin: boolean; startMinimized: boolean };
+  openDataFolder: () => Promise<boolean>;
 }
 
 function getSettings(): SettingsRow {
@@ -159,7 +185,7 @@ function isValidLogoDataUrl(val: unknown): val is string {
   return /^data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]+$/.test(val);
 }
 
-export function createApiRouter(): Router {
+export function createApiRouter(desktopHooks?: DesktopHooks): Router {
   const router = Router();
 
   // ---------------- PUBLIC CONFIG ----------------
@@ -1728,6 +1754,105 @@ export function createApiRouter(): Router {
       },
     });
   });
+
+  // ---------------- ADMIN: NETWORK & PHONE CONNECTION INFO ----------------
+  router.get('/admin/network-info', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
+    const settings = getSettings();
+    const port = Number(process.env.PORT) || APP_CONFIG.port || 3000;
+    const lanIps = getServerLanIps();
+    const primaryIp = getPrimaryLanIp();
+    const phoneUrls = lanIps.map((ip) => `http://${ip}:${port}`);
+    const primaryPhoneUrl = `http://${primaryIp}:${port}`;
+
+    res.json({
+      company_name: settings.company_name,
+      allowed_network_prefix: settings.allowed_network_prefix || '',
+      port,
+      lan_ips: lanIps,
+      primary_ip: primaryIp,
+      local_url: `http://localhost:${port}`,
+      phone_urls: phoneUrls,
+      primary_phone_url: primaryPhoneUrl,
+      client_ip: getClientIp(req),
+      data_dir: DATA_DIR,
+      is_electron: Boolean(desktopHooks?.isElectron),
+    });
+  });
+
+  // ---------------- SUPER ADMIN: DESKTOP & DATA FOLDER ----------------
+  router.get('/super/desktop', requireSuperAdmin, (_req: AuthenticatedRequest, res: Response) => {
+    const desktopSettings = desktopHooks?.getDesktopSettings
+      ? desktopHooks.getDesktopSettings()
+      : {
+          openAtLogin: APP_CONFIG.openAtLogin,
+          startMinimized: APP_CONFIG.startMinimized,
+        };
+
+    res.json({
+      is_electron: Boolean(desktopHooks?.isElectron),
+      data_dir: DATA_DIR,
+      db_path: DB_PATH,
+      photos_dir: PHOTOS_DIR,
+      config_path: CONFIG_PATH,
+      open_at_login: desktopSettings.openAtLogin,
+      start_minimized: desktopSettings.startMinimized,
+    });
+  });
+
+  router.put('/super/desktop', requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
+    const openAtLogin =
+      typeof req.body?.open_at_login === 'boolean' ? req.body.open_at_login : undefined;
+    const startMinimized =
+      typeof req.body?.start_minimized === 'boolean' ? req.body.start_minimized : undefined;
+
+    if (openAtLogin === undefined && startMinimized === undefined) {
+      res.status(400).json({ error: 'Paramètre invalide.' });
+      return;
+    }
+
+    const updatedConfig = updateAppFileConfig({
+      ...(openAtLogin !== undefined ? { openAtLogin } : {}),
+      ...(startMinimized !== undefined ? { startMinimized } : {}),
+    });
+
+    const result = desktopHooks?.setDesktopSettings
+      ? desktopHooks.setDesktopSettings({ openAtLogin, startMinimized })
+      : {
+          openAtLogin: updatedConfig.openAtLogin,
+          startMinimized: updatedConfig.startMinimized,
+        };
+
+    res.json({
+      is_electron: Boolean(desktopHooks?.isElectron),
+      open_at_login: result.openAtLogin,
+      start_minimized: result.startMinimized,
+    });
+  });
+
+  router.post(
+    '/super/open-data-folder',
+    requireSuperAdmin,
+    async (_req: AuthenticatedRequest, res: Response) => {
+      if (desktopHooks?.isElectron && desktopHooks.openDataFolder) {
+        const opened = await desktopHooks.openDataFolder();
+        res.json({
+          ok: opened,
+          data_dir: DATA_DIR,
+          message: opened
+            ? 'Dossier des données ouvert dans l’Explorateur Windows.'
+            : "Impossible d'ouvrir le dossier des données automatiquement.",
+        });
+        return;
+      }
+
+      res.json({
+        ok: false,
+        data_dir: DATA_DIR,
+        message:
+          "L'ouverture directe du dossier n'est disponible que depuis l'application bureau Windows.",
+      });
+    }
+  );
 
   router.get('/super/backup', requireSuperAdmin, async (_req: AuthenticatedRequest, res: Response) => {
     const today = getLocalDateString();

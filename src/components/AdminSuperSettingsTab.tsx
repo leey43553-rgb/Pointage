@@ -6,7 +6,9 @@ import {
   Check,
   Database,
   Download,
+  FolderOpen,
   KeyRound,
+  Monitor,
   Plus,
   Save,
   Trash2,
@@ -14,7 +16,12 @@ import {
   Wifi,
 } from 'lucide-react';
 import { ApiError, apiRequest, downloadAuthenticatedFile, formatFrenchDate } from '../api';
-import type { AppSettings, PhotoRequirement, PublicHolidayEntry } from '../types';
+import type {
+  AppSettings,
+  DesktopSettingsResponse,
+  PhotoRequirement,
+  PublicHolidayEntry,
+} from '../types';
 
 const WEEKDAYS_ORDER: Array<{ day: number; label: string }> = [
   { day: 0, label: 'Dimanche' },
@@ -52,6 +59,11 @@ export const AdminSuperSettingsTab: React.FC<AdminSuperSettingsTabProps> = ({
   const [lanIps, setLanIps] = useState<string[]>([]);
   const [clientIp, setClientIp] = useState('');
 
+  // Desktop & Data folder state
+  const [desktopInfo, setDesktopInfo] = useState<DesktopSettingsResponse | null>(null);
+  const [savingDesktop, setSavingDesktop] = useState(false);
+  const [openingFolder, setOpeningFolder] = useState(false);
+
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [backingUp, setBackingUp] = useState(false);
@@ -68,11 +80,14 @@ export const AdminSuperSettingsTab: React.FC<AdminSuperSettingsTabProps> = ({
     setLoading(true);
     setError(null);
     try {
-      const data = await apiRequest<{
-        settings: AppSettings;
-        lan_ips: string[];
-        client_ip: string;
-      }>('/api/super/settings', { token });
+      const [data, desktop] = await Promise.all([
+        apiRequest<{
+          settings: AppSettings;
+          lan_ips: string[];
+          client_ip: string;
+        }>('/api/super/settings', { token }),
+        apiRequest<DesktopSettingsResponse>('/api/super/desktop', { token }).catch(() => null),
+      ]);
       setCompanyName(data.settings.company_name);
       setLogoDataUrl(data.settings.logo_data_url);
       setOfficialStartTime(data.settings.official_start_time);
@@ -92,6 +107,9 @@ export const AdminSuperSettingsTab: React.FC<AdminSuperSettingsTabProps> = ({
       );
       setLanIps(data.lan_ips || []);
       setClientIp(data.client_ip || '');
+      if (desktop) {
+        setDesktopInfo(desktop);
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Erreur de chargement des paramètres.');
     } finally {
@@ -230,6 +248,70 @@ export const AdminSuperSettingsTab: React.FC<AdminSuperSettingsTabProps> = ({
       setError(err instanceof ApiError ? err.message : 'Erreur lors de la sauvegarde.');
     } finally {
       setBackingUp(false);
+    }
+  };
+
+  const handleToggleDesktopSetting = async (patch: {
+    open_at_login?: boolean;
+    start_minimized?: boolean;
+  }) => {
+    if (savingDesktop) return;
+    setSavingDesktop(true);
+    setError(null);
+    setSuccessMsg(null);
+    try {
+      const res = await apiRequest<{
+        open_at_login: boolean;
+        start_minimized: boolean;
+      }>('/api/super/desktop', {
+        method: 'PUT',
+        token,
+        body: patch,
+      });
+      setDesktopInfo((prev) =>
+        prev
+          ? {
+              ...prev,
+              open_at_login: res.open_at_login,
+              start_minimized: res.start_minimized,
+            }
+          : prev
+      );
+      setSuccessMsg('Préférence de démarrage Windows mise à jour.');
+    } catch (err) {
+      setError(
+        err instanceof ApiError
+          ? err.message
+          : 'Impossible de modifier le paramètre de démarrage.'
+      );
+    } finally {
+      setSavingDesktop(false);
+    }
+  };
+
+  const handleOpenDataFolder = async () => {
+    if (openingFolder) return;
+    setOpeningFolder(true);
+    setError(null);
+    setSuccessMsg(null);
+    try {
+      const res = await apiRequest<{ ok: boolean; data_dir: string; message: string }>(
+        '/api/super/open-data-folder',
+        { method: 'POST', token }
+      );
+      if (res.ok) {
+        setSuccessMsg(res.message);
+      } else {
+        setSuccessMsg(`Dossier des données sur le serveur : ${res.data_dir}`);
+      }
+    } catch (err) {
+      setError(
+        err instanceof ApiError
+          ? err.message
+          : "Impossible d'ouvrir le dossier des données."
+      );
+    } finally {
+      setOpeningFolder(false);
     }
   };
 
@@ -635,27 +717,103 @@ export const AdminSuperSettingsTab: React.FC<AdminSuperSettingsTabProps> = ({
         </div>
       </form>
 
-      {/* Database Backup */}
-      <section className="rounded-2xl bg-white border border-slate-200 p-5 sm:p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      {/* Windows Startup & Data Folder */}
+      <section className="rounded-2xl bg-white border border-slate-200 p-5 sm:p-6 space-y-5">
         <div className="flex items-start gap-3">
-          <Database className="w-6 h-6 text-blue-800 mt-0.5 shrink-0" />
+          <Monitor className="w-6 h-6 text-blue-800 mt-0.5 shrink-0" />
           <div>
-            <h2 className="text-lg font-bold text-slate-900">Sauvegarde de la base de données</h2>
+            <h2 className="text-lg font-bold text-slate-900">
+              Application Windows et démarrage automatique
+            </h2>
             <p className="text-sm text-slate-600">
-              Téléchargez une copie complète du fichier SQLite (<code className="font-mono">pointage.db</code>) sur votre ordinateur ou clé USB.
+              Activez ou désactivez le lancement automatique de Pointage lors de l'ouverture de session Windows.
             </p>
           </div>
         </div>
 
-        <button
-          type="button"
-          onClick={handleBackup}
-          disabled={backingUp}
-          className="min-h-[48px] inline-flex items-center justify-center gap-2 rounded-xl bg-slate-900 px-5 py-2.5 text-sm font-bold text-white hover:bg-slate-800 disabled:opacity-50 whitespace-nowrap shrink-0"
-        >
-          <Download className="w-4 h-4" />
-          {backingUp ? 'Sauvegarde...' : 'Sauvegarder (pointage.db)'}
-        </button>
+        <div className="space-y-3">
+          <label className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 cursor-pointer">
+            <div>
+              <span className="block text-sm font-bold text-slate-900">
+                Lancer automatiquement au démarrage de Windows
+              </span>
+              <span className="block text-xs text-slate-600">
+                Démarre Pointage en arrière-plan dès l'ouverture de session Windows.
+              </span>
+            </div>
+            <input
+              type="checkbox"
+              checked={desktopInfo?.open_at_login ?? true}
+              disabled={savingDesktop}
+              onChange={(e) =>
+                void handleToggleDesktopSetting({ open_at_login: e.target.checked })
+              }
+              className="h-5 w-5 rounded border-slate-300 text-blue-900 focus:ring-blue-700"
+            />
+          </label>
+
+          <label className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 cursor-pointer">
+            <div>
+              <span className="block text-sm font-bold text-slate-900">
+                Démarrer réduit dans la zone de notification (icône près de l'horloge)
+              </span>
+              <span className="block text-xs text-slate-600">
+                Lors du démarrage automatique Windows, la fenêtre reste masquée et accessible depuis l'icône.
+              </span>
+            </div>
+            <input
+              type="checkbox"
+              checked={desktopInfo?.start_minimized ?? true}
+              disabled={savingDesktop}
+              onChange={(e) =>
+                void handleToggleDesktopSetting({ start_minimized: e.target.checked })
+              }
+              className="h-5 w-5 rounded border-slate-300 text-blue-900 focus:ring-blue-700"
+            />
+          </label>
+        </div>
+      </section>
+
+      {/* Data Folder & Database Backup */}
+      <section className="rounded-2xl bg-white border border-slate-200 p-5 sm:p-6 space-y-4">
+        <div className="flex items-start gap-3">
+          <Database className="w-6 h-6 text-blue-800 mt-0.5 shrink-0" />
+          <div className="min-w-0">
+            <h2 className="text-lg font-bold text-slate-900">
+              Dossier des données et sauvegarde
+            </h2>
+            <p className="text-sm text-slate-600">
+              La base SQLite (<code className="font-mono">pointage.db</code>), les photos et la configuration sont stockées en dehors du dossier d'installation pour être préservées lors des mises à jour.
+            </p>
+            {desktopInfo?.data_dir && (
+              <p className="mt-2 text-xs text-slate-700 font-mono bg-slate-100 border border-slate-200 rounded-lg px-3 py-1.5 inline-block break-all">
+                {desktopInfo.data_dir}
+              </p>
+            )}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-end gap-3 pt-1">
+          <button
+            type="button"
+            onClick={() => void handleOpenDataFolder()}
+            disabled={openingFolder}
+            className="min-h-[46px] inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-5 py-2.5 text-sm font-bold text-slate-800 hover:bg-slate-100 disabled:opacity-50 whitespace-nowrap"
+          >
+            <FolderOpen className="w-4 h-4" />
+            {openingFolder ? 'Ouverture...' : 'Ouvrir le dossier des données'}
+          </button>
+
+          <button
+            type="button"
+            onClick={handleBackup}
+            disabled={backingUp}
+            className="min-h-[46px] inline-flex items-center justify-center gap-2 rounded-xl bg-slate-900 px-5 py-2.5 text-sm font-bold text-white hover:bg-slate-800 disabled:opacity-50 whitespace-nowrap"
+          >
+            <Download className="w-4 h-4" />
+            {backingUp ? 'Sauvegarde...' : 'Télécharger une sauvegarde (pointage.db)'}
+          </button>
+        </div>
       </section>
     </div>
   );

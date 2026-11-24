@@ -222,3 +222,27 @@ export interface AppSettings {
   photo_retention_days: number;
   updated_at: string;
 }
+
+export interface NetworkInfoResponse {
+  company_name: string;
+  allowed_network_prefix: string;
+  port: number;
+  lan_ips: string[];
+  primary_ip: string;
+  local_url: string;
+  phone_urls: string[];
+  primary_phone_url: string;
+  client_ip: string;
+  data_dir: string;
+  is_electron: boolean;
+}
+
+export interface DesktopSettingsResponse {
+  is_electron: boolean;
+  data_dir: string;
+  db_path: string;
+  photos_dir: string;
+  config_path: string;
+  open_at_login: boolean;
+  start_minimized: boolean;
+}

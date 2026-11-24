@@ -1,102 +1,93 @@
-# Pointage Entreprise — Installation sur Serveur Windows (Service + Installateur `Setup.exe`)
+# Pointage — Application Bureau Windows (`Pointage-Setup.exe`)
 
-Application complète de pointage (employés et responsables) fonctionnant **100 % en local sur Windows**, en tant que **service Windows natif (`Pointage`)** sans aucune fenêtre de commande ni installation manuelle de Node.js sur le serveur.
+Application locale de pointage des présences (employés et responsables) empaquetée avec **Electron** et **electron-builder**.  
+Le serveur local Express + SQLite démarre directement dans l'application sur le port **`3000`** (`0.0.0.0:3000`), avec icône dans la zone de notification Windows (*system tray*), démarrage automatique avec Windows, capture photo, calendrier photos, export Excel `.xlsx` et page QR code imprimable pour les téléphones.
 
-Toutes les données persistantes sont stockées séparément du logiciel dans le dossier défini par `DATA_DIR` (par défaut **`C:\ProgramData\Pointage`**) :
+Toutes les données sont enregistrées en dehors du dossier du programme (dans **`C:\ProgramData\Pointage`**, ou dans le dossier `userData` de l'utilisateur si `ProgramData` n'est pas accessible en écriture) :
 - `pointage.db` : base SQLite des employés, responsables et pointages
-- `photos/` : photos de présence (organisées par date et employé)
-- `config.json` : configuration serveur (`port`, `host`, secret de session persistant)
-- `logs/` : journaux du service Windows
+- `photos/` : photos de présence et miniatures
+- `config.json` : configuration locale (port, secret de session, préférences de démarrage Windows)
 
-Ainsi, **les mises à jour ne suppriment jamais vos données**.
-
----
-
-## 1. Générer `Setup.exe` sur votre PC de développement
-
-### Prérequis sur votre PC (une seule fois)
-1. **Node.js LTS (v22 ou plus)** : https://nodejs.org
-2. **Inno Setup 6** : https://jrsoftware.org/isdl.php (cochez *Preprocess / Command Line Compiler* lors de l'installation)
-
-### Commandes à exécuter pour produire `Setup.exe`
-
-Ouvrez PowerShell ou l'Invite de commandes (`cmd`) dans le dossier du projet et exécutez :
-
-```bat
-npm install
-npm run build
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\prepare-windows-bundle.ps1
-```
-
-*(Ou double-cliquez simplement sur **`prepare-installer.bat`**, qui enchaîne automatiquement toutes les étapes.)*
-
-Si Inno Setup est installé dans un dossier personnalisé, lancez ensuite :
-```bat
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
-```
-
-Ce processus :
-1. Compile l'interface React (`dist/`) et le serveur de production (`server.js`).
-2. Télécharge et met en cache **Node.js portable (Windows x64)** et **WinSW (Windows Service Wrapper)** dans `build-cache/`.
-3. Assemble le dossier `build-stage/` avec uniquement les dépendances de production compilées pour ce Node.js portable.
-4. Génère l'installateur prêt à copier sur le serveur : **`installer-output\Setup.exe`**.
+Ainsi, **les mises à jour et réinstallations ne suppriment jamais vos données**.
 
 ---
 
-## 2. Installer sur le serveur Windows (sans Node.js ni console)
+## 1. Compiler `Pointage-Setup.exe` sur votre PC
 
-1. Copiez **`Setup.exe`** sur le serveur Windows.
-2. Double-cliquez sur **`Setup.exe`** et acceptez l'élévation Administrateur (UAC).
-3. L'installateur effectue automatiquement toutes les opérations suivantes :
-   - Installe l'application et le runtime Node.js portable dans **`C:\Program Files\Pointage`**.
-   - Crée le dossier de données **`C:\ProgramData\Pointage`** (`photos/` et `logs/`).
-   - Ouvre le **port TCP 3000** dans le Pare-feu Windows (`Pointage (Port 3000)`).
-   - Installe et démarre le service Windows nommé **`Pointage`** (démarrage automatique avec Windows et redémarrage automatique en cas d'incident).
-   - Crée le raccourci **`Pointage Admin`** sur le Bureau qui ouvre `http://localhost:3000`.
-4. Double-cliquez sur **`Pointage Admin`** sur le Bureau : aucune fenêtre noire ne s'ouvre.
+### Prérequis (une seule fois)
+1. **Node.js LTS (v20 ou v22)** : https://nodejs.org
+2. **Outils de compilation Windows (C++ Build Tools)** si `better-sqlite3` doit être recompilé localement : via l'installeur Node.js (« Automatically install necessary tools ») ou **Visual Studio Build Tools** (*Desktop development with C++*).
 
-### Première connexion (Super Administrateur)
-- Cliquez sur **« Espace Responsable »** en haut à droite :
+### Méthode rapide (1 double-clic)
+Double-cliquez simplement sur **`build-electron.bat`** à la racine du projet.  
+Ce script exécute automatiquement :
+1. `npm install --legacy-peer-deps`
+2. `npm run build`
+3. `npx electron-builder install-app-deps` (recompilation de `better-sqlite3` pour Electron)
+4. `npx electron-builder --win --x64`
+
+### Méthode en ligne de commande
+```bat
+npm install --legacy-peer-deps
+npm run electron:build
+```
+
+L'installateur final est généré dans :
+```text
+release\Pointage-Setup.exe
+```
+
+Pour lancer l'application Electron localement en test sans créer l'installateur :
+```bat
+npm run electron:dev
+```
+
+---
+
+## 2. Installer sur le serveur Windows
+
+1. Copiez **`release\Pointage-Setup.exe`** sur le PC serveur Windows.
+2. Double-cliquez sur **`Pointage-Setup.exe`** et acceptez l'élévation Administrateur (UAC).
+3. Choisissez le dossier d'installation (par défaut dans `C:\Program Files\Pointage`), puis terminez l'assistant :
+   - Crée le raccourci **Pointage** sur le Bureau et dans le Menu Démarrer.
+   - Crée `C:\ProgramData\Pointage` avec les droits d'écriture.
+   - Ajoute automatiquement la règle du Pare-feu Windows **« Pointage (Port 3000) »** en entrée TCP pour que les téléphones en Wi-Fi puissent se connecter.
+4. Lancez **Pointage** :
+   - La fenêtre **Pointage** s'ouvre sans barre de menu sur `http://localhost:3000`.
+   - Fermer la fenêtre avec la croix **`X`** réduit l'application dans la **zone de notification Windows** (près de l'horloge) sans arrêter le serveur.
+   - Un clic droit sur l'icône près de l'horloge affiche : **Ouvrir Pointage**, **Adresse pour les téléphones: http://\<IP\>:3000** (clic pour copier) et **Quitter**.
+   - Une seule instance peut tourner à la fois : relancer **Pointage** met au premier plan la fenêtre déjà ouverte.
+
+### Première connexion et QR Code pour l'entrée
+- Cliquez sur **« Espace Responsable »** :
   - **Nom d'utilisateur** : `admin`
   - **Mot de passe** : `Admin1234`
-- Rendez-vous immédiatement dans **Paramètres** pour changer ce mot de passe, configurer votre entreprise, les jours travaillés, les jours fériés et l'option photo.
-
-### Accès depuis les téléphones (Wi-Fi de l'entreprise)
-Sur les téléphones Android ou iPhone connectés au même réseau Wi-Fi, ouvrez :
-```text
-http://IP-DU-SERVEUR:3000
-```
-L'application s'installe sur l'écran d'accueil en tant que **PWA** (*Ajouter à l'écran d'accueil*).
+- Allez dans **Paramètres** pour changer le mot de passe et configurer l'entreprise.
+- Ouvrez l'onglet **« Connexion des téléphones »** pour afficher l'IP locale, le lien `http://IP:3000` et **imprimer l'affiche avec QR code** à coller à l'entrée.
 
 ---
 
-## 3. Mettre à jour l'application sans perdre les données
+## 3. Configurer le démarrage et l'ouverture de session automatique Windows
 
-Lorsqu'une nouvelle version est prête (`Setup.exe` recompilé) :
-1. Copiez le nouveau **`Setup.exe`** sur le serveur et lancez-le directement (**ne désinstallez pas manuellement**, ou même si vous désinstallez, `C:\ProgramData\Pointage` est conservé).
-2. `Setup.exe` arrête automatiquement le service `Pointage`, remplace uniquement les fichiers de programme dans `C:\Program Files\Pointage`, puis redémarre le service.
-3. Vos fichiers `pointage.db`, `photos/` et `config.json` dans `C:\ProgramData\Pointage` restent **100 % intacts**.
+### Démarrage automatique intégré à Pointage
+Au **premier lancement**, Pointage active automatiquement son lancement au démarrage de Windows et démarre réduit dans la zone de notification (`--minimized`).  
+Vous pouvez activer ou désactiver cette option à tout moment dans **Paramètres → Application Windows et démarrage automatique**.
 
-### Changer l'emplacement des données (`DATA_DIR`)
-Si vous souhaitez stocker les données sur un autre disque (ex. `D:\DonneesPointage`) :
-1. Définissez la variable d'environnement système Windows `DATA_DIR=D:\DonneesPointage`.
-2. Arrêtez le service `Pointage`, copiez le contenu de `C:\ProgramData\Pointage` vers `D:\DonneesPointage`, puis redémarrez le service `Pointage` depuis `services.msc`.
+### Ouverture de session automatique Windows (recommandé sur un serveur)
+Pour que le PC serveur ouvre automatiquement Windows après une coupure de courant ou un redémarrage (et lance ainsi Pointage sans taper de mot de passe) :
+1. Appuyez sur **`Win + R`**, tapez **`netplwiz`** et validez.
+2. Sélectionnez le compte utilisateur Windows du serveur.
+3. Décochez **« Les utilisateurs doivent entrer un nom d'utilisateur et un mot de passe pour utiliser cet ordinateur »**, puis cliquez sur **Appliquer**.
+4. Saisissez deux fois le mot de passe Windows de ce compte et validez par **OK**.
 
----
-
-## 4. Gestion manuelle du service Windows (optionnel)
-
-Les scripts suivants (dans `service/` ou `C:\Program Files\Pointage\`) permettent de gérer le service manuellement en tant qu'administrateur :
-- **`install-service.bat`** : installe et démarre le service `Pointage` (démarrage auto + relance sur échec + règle Pare-feu).
-- **`uninstall-service.bat`** : arrête et supprime le service `Pointage` sans toucher aux données.
-- **Lancement ponctuel en console** : `npm run build` puis `node server.js` (écoute sur `0.0.0.0:3000`).
+*(Si l'option n'apparaît pas sur Windows 11, ouvrez **Paramètres Windows → Comptes → Options de connexion** et désactivez temporairement **« Exiger la connexion Windows Hello pour les comptes Microsoft »**).*
 
 ---
 
-## 5. Dépendances principales
+## 4. Mettre à jour l'application sans perdre les données
 
-- `exceljs` : export mensuel Excel `.xlsx` multi-onglets (Résumé du mois + une fiche par employé).
-- `multer` et `@types/multer` : réception sécurisée des photos de présence.
-- `jimp` : génération de miniatures 200px côté serveur pour le calendrier photos.
-- `better-sqlite3`, `bcryptjs`, `vite-plugin-pwa` : SQLite local, hachage des mots de passe et PWA.
-- **WinSW v2.12** et **Inno Setup 6** : exécution en service Windows et création de `Setup.exe`.
+1. Sur le PC serveur, faites un clic droit sur l'icône **Pointage** près de l'horloge et cliquez sur **Quitter** (si l'application est en cours d'exécution).
+2. Exécutez le nouveau **`Pointage-Setup.exe`** dans le même dossier d'installation.
+3. Relancez **Pointage** : vos employés, pointages (`pointage.db`), photos (`photos/`) et réglages (`config.json`) dans `C:\ProgramData\Pointage` sont **100 % conservés**.
+
+> **Astuce sauvegarde** : dans **Paramètres → Dossier des données et sauvegarde**, vous disposez d'un bouton **« Ouvrir le dossier des données »** et d'un bouton **« Télécharger une sauvegarde (pointage.db) »**.

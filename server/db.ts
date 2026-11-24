@@ -9,6 +9,9 @@ export interface AppFileConfig {
   port: number;
   host: string;
   sessionSecret: string;
+  openAtLogin: boolean;
+  startMinimized: boolean;
+  startupConfigured: boolean;
 }
 
 export interface PublicHolidayEntry {
@@ -157,10 +160,23 @@ function loadOrCreateAppConfig(): AppFileConfig {
       : crypto.randomBytes(32).toString('hex');
   if (sessionSecret !== parsed.sessionSecret) needsWrite = true;
 
+  const openAtLogin = typeof parsed.openAtLogin === 'boolean' ? parsed.openAtLogin : true;
+  if (openAtLogin !== parsed.openAtLogin) needsWrite = true;
+
+  const startMinimized = typeof parsed.startMinimized === 'boolean' ? parsed.startMinimized : true;
+  if (startMinimized !== parsed.startMinimized) needsWrite = true;
+
+  const startupConfigured =
+    typeof parsed.startupConfigured === 'boolean' ? parsed.startupConfigured : false;
+  if (startupConfigured !== parsed.startupConfigured) needsWrite = true;
+
   const config: AppFileConfig = {
     port,
     host,
     sessionSecret,
+    openAtLogin,
+    startMinimized,
+    startupConfigured,
   };
 
   if (needsWrite) {
@@ -178,6 +194,29 @@ function loadOrCreateAppConfig(): AppFileConfig {
 }
 
 export const APP_CONFIG = loadOrCreateAppConfig();
+
+export function updateAppFileConfig(
+  patch: Partial<Pick<AppFileConfig, 'openAtLogin' | 'startMinimized' | 'startupConfigured'>>
+): AppFileConfig {
+  if (typeof patch.openAtLogin === 'boolean') {
+    APP_CONFIG.openAtLogin = patch.openAtLogin;
+  }
+  if (typeof patch.startMinimized === 'boolean') {
+    APP_CONFIG.startMinimized = patch.startMinimized;
+  }
+  if (typeof patch.startupConfigured === 'boolean') {
+    APP_CONFIG.startupConfigured = patch.startupConfigured;
+  }
+  try {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(APP_CONFIG, null, 2) + '\n', {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+  } catch {
+    // Ignore write error if read-only
+  }
+  return { ...APP_CONFIG };
+}
 
 export const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');

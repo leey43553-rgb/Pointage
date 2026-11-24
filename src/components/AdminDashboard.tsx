@@ -11,6 +11,7 @@ import {
   RefreshCw,
   Settings,
   Shield,
+  Smartphone,
   Users,
   XCircle,
 } from 'lucide-react';
@@ -33,6 +34,7 @@ import type {
   PublicConfig,
   TodayDashboardResponse,
 } from '../types';
+import { AdminPhonesTab } from './AdminPhonesTab';
 import { AdminPhotoCalendarTab } from './AdminPhotoCalendarTab';
 import { AdminSuperAdminsTab } from './AdminSuperAdminsTab';
 import { AdminSuperEmployeesTab } from './AdminSuperEmployeesTab';
@@ -44,7 +46,15 @@ import {
   type PhotoDetailModalPayload,
 } from './ProtectedPhoto';
 
-type AdminTab = 'today' | 'monthly' | 'photos' | 'history' | 'employees' | 'admins' | 'settings';
+type AdminTab =
+  | 'today'
+  | 'monthly'
+  | 'photos'
+  | 'history'
+  | 'phones'
+  | 'employees'
+  | 'admins'
+  | 'settings';
 
 interface AdminDashboardProps {
   token: string;
@@ -249,6 +259,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     { id: 'monthly', label: 'Bilan mensuel', icon: <FileSpreadsheet className="w-4 h-4" /> },
     { id: 'photos', label: 'Calendrier photos', icon: <Camera className="w-4 h-4" /> },
     { id: 'history', label: 'Historique', icon: <CalendarDays className="w-4 h-4" /> },
+    { id: 'phones', label: 'Connexion des téléphones', icon: <Smartphone className="w-4 h-4" /> },
     { id: 'employees', label: 'Employés', icon: <Users className="w-4 h-4" />, superOnly: true },
     { id: 'admins', label: 'Administrateurs', icon: <Shield className="w-4 h-4" />, superOnly: true },
     { id: 'settings', label: 'Paramètres', icon: <Settings className="w-4 h-4" />, superOnly: true },
@@ -959,6 +970,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               )}
             </div>
           </div>
+        )}
+
+        {/* TAB: CONNEXION DES TELEPHONES */}
+        {activeTab === 'phones' && (
+          <AdminPhonesTab
+            token={token}
+            config={config}
+            onUnauthorized={handleLogoutClick}
+          />
         )}
 
         {/* TAB 4: EMPLOYEES (SUPER ADMIN) */}
