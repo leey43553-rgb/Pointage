@@ -1,0 +1,6 @@
+{
+  "name": "Pointage Entreprise",
+  "description": "Application locale de pointage des présences pour employés et responsables.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
