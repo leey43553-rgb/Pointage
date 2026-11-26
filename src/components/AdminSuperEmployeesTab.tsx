@@ -39,6 +39,9 @@ export const AdminSuperEmployeesTab: React.FC<AdminSuperEmployeesTabProps> = ({
   const [firstName, setFirstName] = useState('');
   const [lastName, setLastName] = useState('');
   const [jobTitle, setJobTitle] = useState('');
+  const [shiftStart, setShiftStart] = useState('');
+  const [shiftEnd, setShiftEnd] = useState('');
+  const [graceMinutes, setGraceMinutes] = useState('');
   const [creating, setCreating] = useState(false);
 
   // Edit state
@@ -46,6 +49,9 @@ export const AdminSuperEmployeesTab: React.FC<AdminSuperEmployeesTabProps> = ({
   const [editFirst, setEditFirst] = useState('');
   const [editLast, setEditLast] = useState('');
   const [editJob, setEditJob] = useState('');
+  const [editShiftStart, setEditShiftStart] = useState('');
+  const [editShiftEnd, setEditShiftEnd] = useState('');
+  const [editGraceMinutes, setEditGraceMinutes] = useState('');
 
   // Confirmations
   const [confirmRegenId, setConfirmRegenId] = useState<number | null>(null);
@@ -82,11 +88,17 @@ export const AdminSuperEmployeesTab: React.FC<AdminSuperEmployeesTabProps> = ({
           first_name: firstName,
           last_name: lastName,
           job_title: jobTitle,
+          shift_start: shiftStart || null,
+          shift_end: shiftEnd || null,
+          grace_minutes: graceMinutes !== '' ? Number(graceMinutes) : null,
         },
       });
       setFirstName('');
       setLastName('');
       setJobTitle('');
+      setShiftStart('');
+      setShiftEnd('');
+      setGraceMinutes('');
       setRevealedIds((prev) => ({ ...prev, [data.employee.id]: true }));
       setSuccessMsg(
         `Employé ajouté : ${data.employee.first_name} ${data.employee.last_name} — Code attribué : ${data.employee.code}`
@@ -112,6 +124,9 @@ export const AdminSuperEmployeesTab: React.FC<AdminSuperEmployeesTabProps> = ({
           first_name: editFirst,
           last_name: editLast,
           job_title: editJob,
+          shift_start: editShiftStart || null,
+          shift_end: editShiftEnd || null,
+          grace_minutes: editGraceMinutes !== '' ? Number(editGraceMinutes) : null,
         },
       });
       setEditingEmp(null);
@@ -219,47 +234,91 @@ export const AdminSuperEmployeesTab: React.FC<AdminSuperEmployeesTabProps> = ({
           </button>
         </div>
 
-        <form onSubmit={handleAdd} className="grid grid-cols-1 sm:grid-cols-4 gap-3 items-end">
-          <div>
-            <label className="block text-sm font-semibold text-slate-700 mb-1">Prénom *</label>
-            <input
-              type="text"
-              required
-              value={firstName}
-              onChange={(e) => setFirstName(e.target.value)}
-              placeholder="ex: Jean"
-              className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-700"
-            />
+        <form onSubmit={handleAdd} className="space-y-3">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div>
+              <label className="block text-sm font-semibold text-slate-700 mb-1">Prénom *</label>
+              <input
+                type="text"
+                required
+                value={firstName}
+                onChange={(e) => setFirstName(e.target.value)}
+                placeholder="ex: Jean"
+                className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-700"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-semibold text-slate-700 mb-1">Nom *</label>
+              <input
+                type="text"
+                required
+                value={lastName}
+                onChange={(e) => setLastName(e.target.value)}
+                placeholder="ex: Dupont"
+                className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-700"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-semibold text-slate-700 mb-1">Poste (optionnel)</label>
+              <input
+                type="text"
+                value={jobTitle}
+                onChange={(e) => setJobTitle(e.target.value)}
+                placeholder="ex: Technicien"
+                className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-700"
+              />
+            </div>
           </div>
-          <div>
-            <label className="block text-sm font-semibold text-slate-700 mb-1">Nom *</label>
-            <input
-              type="text"
-              required
-              value={lastName}
-              onChange={(e) => setLastName(e.target.value)}
-              placeholder="ex: Dupont"
-              className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-700"
-            />
+
+          <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 items-end">
+            <div>
+              <label className="block text-xs font-semibold text-slate-600 mb-1">
+                Début horaire (optionnel)
+              </label>
+              <input
+                type="time"
+                value={shiftStart}
+                onChange={(e) => setShiftStart(e.target.value)}
+                className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm font-mono text-slate-900"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-600 mb-1">
+                Fin horaire (optionnel)
+              </label>
+              <input
+                type="time"
+                value={shiftEnd}
+                onChange={(e) => setShiftEnd(e.target.value)}
+                className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm font-mono text-slate-900"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-600 mb-1">
+                Tolérance retard (min, optionnel)
+              </label>
+              <input
+                type="number"
+                min={0}
+                max={180}
+                value={graceMinutes}
+                onChange={(e) => setGraceMinutes(e.target.value)}
+                placeholder="Défaut global"
+                className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm font-mono text-slate-900"
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={creating}
+              className="min-h-[44px] inline-flex items-center justify-center gap-2 rounded-xl bg-blue-900 px-5 py-2.5 text-sm font-bold text-white hover:bg-blue-950 disabled:opacity-50 transition whitespace-nowrap"
+            >
+              <Plus className="w-4 h-4" />
+              {creating ? 'Création...' : 'Ajouter'}
+            </button>
           </div>
-          <div>
-            <label className="block text-sm font-semibold text-slate-700 mb-1">Poste (optionnel)</label>
-            <input
-              type="text"
-              value={jobTitle}
-              onChange={(e) => setJobTitle(e.target.value)}
-              placeholder="ex: Technicien"
-              className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-700"
-            />
-          </div>
-          <button
-            type="submit"
-            disabled={creating}
-            className="min-h-[44px] inline-flex items-center justify-center gap-2 rounded-xl bg-blue-900 px-5 py-2.5 text-sm font-bold text-white hover:bg-blue-950 disabled:opacity-50 transition whitespace-nowrap"
-          >
-            <Plus className="w-4 h-4" />
-            {creating ? 'Création...' : 'Ajouter'}
-          </button>
+          <p className="text-xs text-slate-500">
+            Laissez les horaires vides pour utiliser l'heure d'arrivée et la tolérance globales définies dans Paramètres.
+          </p>
         </form>
       </section>
 
@@ -282,28 +341,30 @@ export const AdminSuperEmployeesTab: React.FC<AdminSuperEmployeesTabProps> = ({
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
           <form
             onSubmit={handleSaveEdit}
-            className="w-full max-w-md rounded-2xl bg-white border border-slate-200 p-6 shadow-xl space-y-4"
+            className="w-full max-w-lg rounded-2xl bg-white border border-slate-200 p-6 shadow-xl space-y-4"
           >
             <h3 className="text-lg font-bold text-slate-900">Modifier l'employé</h3>
-            <div>
-              <label className="block text-sm font-semibold text-slate-700 mb-1">Prénom *</label>
-              <input
-                type="text"
-                required
-                value={editFirst}
-                onChange={(e) => setEditFirst(e.target.value)}
-                className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-semibold text-slate-700 mb-1">Nom *</label>
-              <input
-                type="text"
-                required
-                value={editLast}
-                onChange={(e) => setEditLast(e.target.value)}
-                className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm"
-              />
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-1">Prénom *</label>
+                <input
+                  type="text"
+                  required
+                  value={editFirst}
+                  onChange={(e) => setEditFirst(e.target.value)}
+                  className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-1">Nom *</label>
+                <input
+                  type="text"
+                  required
+                  value={editLast}
+                  onChange={(e) => setEditLast(e.target.value)}
+                  className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm"
+                />
+              </div>
             </div>
             <div>
               <label className="block text-sm font-semibold text-slate-700 mb-1">Poste</label>
@@ -313,6 +374,45 @@ export const AdminSuperEmployeesTab: React.FC<AdminSuperEmployeesTabProps> = ({
                 onChange={(e) => setEditJob(e.target.value)}
                 className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm"
               />
+            </div>
+            <div className="pt-2 border-t border-slate-200">
+              <p className="text-xs font-bold text-slate-700 mb-2">
+                Horaire personnalisé (laisser vide pour l'horaire global)
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-600 mb-1">Début</label>
+                  <input
+                    type="time"
+                    value={editShiftStart}
+                    onChange={(e) => setEditShiftStart(e.target.value)}
+                    className="w-full min-h-[42px] rounded-xl border border-slate-300 px-3 py-1.5 text-sm font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-slate-600 mb-1">Fin</label>
+                  <input
+                    type="time"
+                    value={editShiftEnd}
+                    onChange={(e) => setEditShiftEnd(e.target.value)}
+                    className="w-full min-h-[42px] rounded-xl border border-slate-300 px-3 py-1.5 text-sm font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-slate-600 mb-1">
+                    Tolérance (min)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={180}
+                    value={editGraceMinutes}
+                    onChange={(e) => setEditGraceMinutes(e.target.value)}
+                    placeholder="Global"
+                    className="w-full min-h-[42px] rounded-xl border border-slate-300 px-3 py-1.5 text-sm font-mono"
+                  />
+                </div>
+              </div>
             </div>
             <div className="flex justify-end gap-3 pt-2">
               <button
@@ -375,6 +475,21 @@ export const AdminSuperEmployeesTab: React.FC<AdminSuperEmployeesTabProps> = ({
                       >
                         {emp.is_active === 1 ? 'Actif' : 'Désactivé'}
                       </span>
+                    </div>
+
+                    <div className="mt-1.5 flex flex-wrap items-center gap-2 text-xs text-slate-600">
+                      <span className="font-semibold text-slate-500">Horaire :</span>
+                      {emp.shift_start || emp.shift_end || emp.grace_minutes !== null ? (
+                        <span className="font-mono font-semibold text-blue-900">
+                          {emp.shift_start || 'Défaut'}
+                          {emp.shift_end ? ` – ${emp.shift_end}` : ''}
+                          {emp.grace_minutes !== null && emp.grace_minutes !== undefined
+                            ? ` · Tolérance ${emp.grace_minutes} min`
+                            : ''}
+                        </span>
+                      ) : (
+                        <span>Horaire global par défaut</span>
+                      )}
                     </div>
 
                     <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -450,6 +565,13 @@ export const AdminSuperEmployeesTab: React.FC<AdminSuperEmployeesTabProps> = ({
                         setEditFirst(emp.first_name);
                         setEditLast(emp.last_name);
                         setEditJob(emp.job_title);
+                        setEditShiftStart(emp.shift_start || '');
+                        setEditShiftEnd(emp.shift_end || '');
+                        setEditGraceMinutes(
+                          emp.grace_minutes !== null && emp.grace_minutes !== undefined
+                            ? String(emp.grace_minutes)
+                            : ''
+                        );
                       }}
                       className="min-h-[40px] inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100"
                     >

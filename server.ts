@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runAutoCloseMissingCheckouts } from './server/attendanceLogic.ts';
 import {
   APP_CONFIG,
   CONFIG_PATH,
@@ -42,6 +43,14 @@ function runPhotoRetentionJob(): void {
   }
 }
 
+function runAutoCloseJob(): void {
+  try {
+    runAutoCloseMissingCheckouts();
+  } catch {
+    // ignore background auto-close error
+  }
+}
+
 export interface StartedPointageServer {
   httpServer: http.Server;
   app: express.Express;
@@ -74,8 +83,11 @@ export async function startServer(options?: {
 
   await initDb();
   runPhotoRetentionJob();
+  runAutoCloseJob();
   const retentionTimer = setInterval(runPhotoRetentionJob, 6 * 60 * 60 * 1000);
   retentionTimer.unref();
+  const autoCloseTimer = setInterval(runAutoCloseJob, 60 * 1000);
+  autoCloseTimer.unref();
 
   const app = express();
   app.use(express.json({ limit: '1mb' }));
@@ -109,10 +121,29 @@ export async function startServer(options?: {
     });
   } else if (!(typeof __PROD_BUNDLE__ !== 'undefined' && __PROD_BUNDLE__)) {
     const { createServer: createViteServer } = await import('vite');
+    const disableHmr = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
+      plugins: disableHmr
+        ? [
+            {
+              name: 'disable-hmr-client-ws',
+              enforce: 'post',
+              transform(code, id) {
+                if (id.includes('vite/dist/client/client.mjs')) {
+                  return code.replace(
+                    /let wsTransport = createWebSocketModuleRunnerTransport\(\{[\s\S]*?\}\);/,
+                    'let wsTransport = { async connect() {}, async disconnect() {}, send() {} };'
+                  );
+                }
+                return null;
+              },
+            },
+          ]
+        : [],
       server: {
         middlewareMode: true,
-        hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
+        hmr: !disableHmr,
+        ws: disableHmr ? false : { server: httpServer },
       },
       appType: 'spa',
     });
@@ -151,6 +182,7 @@ export async function startServer(options?: {
 
   const closeServer = async () => {
     clearInterval(retentionTimer);
+    clearInterval(autoCloseTimer);
     await new Promise<void>((resolve) => {
       httpServer.close(() => resolve());
     });

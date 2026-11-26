@@ -33,6 +33,7 @@ export interface SettingsRow {
   public_holidays: string;
   photo_requirement: PhotoRequirement;
   photo_retention_days: number;
+  auto_close_time: string;
   updated_at: string;
 }
 
@@ -52,6 +53,9 @@ export interface EmployeeRow {
   job_title: string;
   code: string;
   is_active: number;
+  shift_start: string | null;
+  shift_end: string | null;
+  grace_minutes: number | null;
   created_at: string;
 }
 
@@ -70,6 +74,10 @@ export interface AttendanceRow {
   is_late: number;
   late_minutes: number;
   worked_minutes: number;
+  checkout_missing: number;
+  auto_closed_at: string | null;
+  is_corrected: number;
+  last_correction_reason: string | null;
   created_at: string;
 }
 
@@ -81,6 +89,45 @@ export interface PhotoRow {
   work_date: string;
   file_path: string;
   thumb_path: string | null;
+  created_at: string;
+}
+
+export type CorrectionRequestStatus = 'pending' | 'approved' | 'rejected';
+
+export interface CorrectionRequestRow {
+  id: number;
+  employee_id: number;
+  work_date: string;
+  punch_type: 'checkin' | 'checkout';
+  requested_time: string;
+  reason: string;
+  status: CorrectionRequestStatus;
+  reviewed_by_admin_id: number | null;
+  reviewed_by_username: string | null;
+  review_note: string | null;
+  reviewed_at: string | null;
+  created_at: string;
+}
+
+export type CorrectionLogActionType =
+  | 'manual_add'
+  | 'manual_edit'
+  | 'request_approved'
+  | 'request_rejected'
+  | 'auto_close';
+
+export interface CorrectionLogRow {
+  id: number;
+  attendance_id: number | null;
+  employee_id: number;
+  employee_name: string;
+  work_date: string;
+  action_type: CorrectionLogActionType;
+  actor_admin_id: number | null;
+  actor_username: string;
+  old_value: string;
+  new_value: string;
+  reason: string;
   created_at: string;
 }
 
@@ -596,6 +643,7 @@ export async function initDb(): Promise<void> {
       public_holidays TEXT NOT NULL DEFAULT '[]',
       photo_requirement TEXT NOT NULL DEFAULT 'both',
       photo_retention_days INTEGER NOT NULL DEFAULT 90,
+      auto_close_time TEXT NOT NULL DEFAULT '23:59',
       updated_at TEXT NOT NULL
     );
 
@@ -615,6 +663,9 @@ export async function initDb(): Promise<void> {
       job_title TEXT NOT NULL DEFAULT '',
       code TEXT NOT NULL UNIQUE,
       is_active INTEGER NOT NULL DEFAULT 1,
+      shift_start TEXT DEFAULT NULL,
+      shift_end TEXT DEFAULT NULL,
+      grace_minutes INTEGER DEFAULT NULL,
       created_at TEXT NOT NULL
     );
 
@@ -633,6 +684,10 @@ export async function initDb(): Promise<void> {
       is_late INTEGER NOT NULL DEFAULT 0,
       late_minutes INTEGER NOT NULL DEFAULT 0,
       worked_minutes INTEGER NOT NULL DEFAULT 0,
+      checkout_missing INTEGER NOT NULL DEFAULT 0,
+      auto_closed_at TEXT DEFAULT NULL,
+      is_corrected INTEGER NOT NULL DEFAULT 0,
+      last_correction_reason TEXT DEFAULT NULL,
       created_at TEXT NOT NULL,
       UNIQUE(employee_id, work_date)
     );
@@ -660,6 +715,36 @@ export async function initDb(): Promise<void> {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS correction_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+      work_date TEXT NOT NULL,
+      punch_type TEXT NOT NULL CHECK (punch_type IN ('checkin', 'checkout')),
+      requested_time TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected')) DEFAULT 'pending',
+      reviewed_by_admin_id INTEGER DEFAULT NULL,
+      reviewed_by_username TEXT DEFAULT NULL,
+      review_note TEXT DEFAULT NULL,
+      reviewed_at TEXT DEFAULT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS correction_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      attendance_id INTEGER DEFAULT NULL,
+      employee_id INTEGER NOT NULL,
+      employee_name TEXT NOT NULL,
+      work_date TEXT NOT NULL,
+      action_type TEXT NOT NULL CHECK (action_type IN ('manual_add', 'manual_edit', 'request_approved', 'request_rejected', 'auto_close')),
+      actor_admin_id INTEGER DEFAULT NULL,
+      actor_username TEXT NOT NULL,
+      old_value TEXT NOT NULL,
+      new_value TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS pin_attempts (
       key TEXT PRIMARY KEY,
       attempts INTEGER NOT NULL DEFAULT 0,
@@ -672,6 +757,10 @@ export async function initDb(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_photos_date ON photos(work_date);
     CREATE INDEX IF NOT EXISTS idx_photos_employee_date ON photos(employee_id, work_date);
     CREATE INDEX IF NOT EXISTS idx_logs_date ON attendance_logs(log_date);
+    CREATE INDEX IF NOT EXISTS idx_correction_requests_status ON correction_requests(status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_correction_requests_emp ON correction_requests(employee_id, work_date);
+    CREATE INDEX IF NOT EXISTS idx_correction_logs_date ON correction_logs(work_date, id);
+    CREATE INDEX IF NOT EXISTS idx_correction_logs_emp ON correction_logs(employee_id, id);
   `);
 
   // Migrate existing settings table if columns are missing
@@ -689,8 +778,24 @@ export async function initDb(): Promise<void> {
   if (!colNames.has('photo_retention_days')) {
     db.exec(`ALTER TABLE settings ADD COLUMN photo_retention_days INTEGER NOT NULL DEFAULT 90`);
   }
+  if (!colNames.has('auto_close_time')) {
+    db.exec(`ALTER TABLE settings ADD COLUMN auto_close_time TEXT NOT NULL DEFAULT '23:59'`);
+  }
 
-  // Migrate existing attendance table if photo columns are missing
+  // Migrate existing employees table if shift columns are missing
+  const empCols = db.prepare('PRAGMA table_info(employees)').all() as Array<{ name: string }>;
+  const empColNames = new Set(empCols.map((c) => c.name));
+  if (!empColNames.has('shift_start')) {
+    db.exec(`ALTER TABLE employees ADD COLUMN shift_start TEXT DEFAULT NULL`);
+  }
+  if (!empColNames.has('shift_end')) {
+    db.exec(`ALTER TABLE employees ADD COLUMN shift_end TEXT DEFAULT NULL`);
+  }
+  if (!empColNames.has('grace_minutes')) {
+    db.exec(`ALTER TABLE employees ADD COLUMN grace_minutes INTEGER DEFAULT NULL`);
+  }
+
+  // Migrate existing attendance table if photo or correction columns are missing
   const attCols = db.prepare('PRAGMA table_info(attendance)').all() as Array<{ name: string }>;
   const attColNames = new Set(attCols.map((c) => c.name));
   if (!attColNames.has('checkin_photo')) {
@@ -704,6 +809,18 @@ export async function initDb(): Promise<void> {
   }
   if (!attColNames.has('checkout_photo_id')) {
     db.exec(`ALTER TABLE attendance ADD COLUMN checkout_photo_id INTEGER DEFAULT NULL`);
+  }
+  if (!attColNames.has('checkout_missing')) {
+    db.exec(`ALTER TABLE attendance ADD COLUMN checkout_missing INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!attColNames.has('auto_closed_at')) {
+    db.exec(`ALTER TABLE attendance ADD COLUMN auto_closed_at TEXT DEFAULT NULL`);
+  }
+  if (!attColNames.has('is_corrected')) {
+    db.exec(`ALTER TABLE attendance ADD COLUMN is_corrected INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!attColNames.has('last_correction_reason')) {
+    db.exec(`ALTER TABLE attendance ADD COLUMN last_correction_reason TEXT DEFAULT NULL`);
   }
 
   // Backfill photos table for any legacy attendance rows that already have file paths

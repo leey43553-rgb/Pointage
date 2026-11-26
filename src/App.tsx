@@ -9,6 +9,7 @@ import type {
   AdminUser,
   AttendanceRecord,
   EmployeeProfile,
+  MissingYesterdayInfo,
   PhotoRequirement,
   PublicConfig,
 } from './types';
@@ -20,6 +21,7 @@ type AppSession =
       token: string;
       employee: EmployeeProfile;
       todayAttendance: AttendanceRecord | null;
+      missingYesterday: MissingYesterdayInfo | null;
       photoRequirement: PhotoRequirement;
     }
   | { kind: 'admin_login' }
@@ -59,6 +61,7 @@ export default function App() {
               token: data.token,
               employee: data.employee,
               todayAttendance: data.today_attendance,
+              missingYesterday: data.missing_yesterday || null,
               photoRequirement: data.photo_requirement || config?.photo_requirement || 'both',
             })
           }
@@ -71,6 +74,7 @@ export default function App() {
           token={session.token}
           employee={session.employee}
           initialAttendance={session.todayAttendance}
+          initialMissingYesterday={session.missingYesterday}
           photoRequirement={config?.photo_requirement || session.photoRequirement}
           config={config}
           onLogout={() => {

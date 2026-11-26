@@ -8,7 +8,16 @@ export interface PhotoDetailModalPayload {
   dateIso: string;
   dateLabel: string;
   attendanceId: number | null;
-  status: 'present' | 'late' | 'absent' | 'weekend' | 'holiday' | 'leave' | 'future';
+  status:
+    | 'present'
+    | 'late'
+    | 'absent'
+    | 'unreported'
+    | 'missing_checkout'
+    | 'weekend'
+    | 'holiday'
+    | 'leave'
+    | 'future';
   checkinTime: string | null;
   checkoutTime: string | null;
   lateMinutes: number;
@@ -304,7 +313,11 @@ export const PhotoAttendanceDetailModal: React.FC<PhotoAttendanceDetailModalProp
   };
 
   const statusLabel =
-    detail.status === 'late'
+    detail.status === 'missing_checkout'
+      ? 'Départ manquant'
+      : detail.status === 'unreported'
+      ? 'Non signalé'
+      : detail.status === 'late'
       ? `En retard (${detail.lateMinutes} min)`
       : detail.status === 'present'
       ? "À l'heure"
@@ -319,12 +332,12 @@ export const PhotoAttendanceDetailModal: React.FC<PhotoAttendanceDetailModalProp
       : 'À venir';
 
   const statusColor =
-    detail.status === 'late'
+    detail.status === 'missing_checkout' || detail.status === 'absent'
+      ? 'text-red-700'
+      : detail.status === 'unreported' || detail.status === 'late'
       ? 'text-amber-700'
       : detail.status === 'present'
       ? 'text-emerald-700'
-      : detail.status === 'absent'
-      ? 'text-red-700'
       : 'text-slate-600';
 
   const ipDisplay = [

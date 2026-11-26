@@ -56,6 +56,7 @@ export const AdminSuperSettingsTab: React.FC<AdminSuperSettingsTabProps> = ({
   const [newHolidayLabel, setNewHolidayLabel] = useState('');
   const [photoRequirement, setPhotoRequirement] = useState<PhotoRequirement>('both');
   const [photoRetentionDays, setPhotoRetentionDays] = useState(90);
+  const [autoCloseTime, setAutoCloseTime] = useState('23:59');
   const [lanIps, setLanIps] = useState<string[]>([]);
   const [clientIp, setClientIp] = useState('');
 
@@ -105,6 +106,7 @@ export const AdminSuperSettingsTab: React.FC<AdminSuperSettingsTabProps> = ({
           ? data.settings.photo_retention_days
           : 90
       );
+      setAutoCloseTime(data.settings.auto_close_time || '23:59');
       setLanIps(data.lan_ips || []);
       setClientIp(data.client_ip || '');
       if (desktop) {
@@ -194,6 +196,7 @@ export const AdminSuperSettingsTab: React.FC<AdminSuperSettingsTabProps> = ({
           public_holidays: publicHolidays,
           photo_requirement: photoRequirement,
           photo_retention_days: Number(photoRetentionDays),
+          auto_close_time: autoCloseTime,
         },
       });
       setSuccessMsg('Paramètres enregistrés avec succès.');
@@ -426,6 +429,22 @@ export const AdminSuperSettingsTab: React.FC<AdminSuperSettingsTabProps> = ({
             />
             <p className="mt-1 text-xs text-slate-500">
               Exemple : 10 min avec début à 09:00 = retard compté à partir de 09:11.
+            </p>
+          </div>
+
+          <div>
+            <label className="block text-sm font-semibold text-slate-700 mb-1.5">
+              Clôture automatique des départs oubliés
+            </label>
+            <input
+              type="time"
+              required
+              value={autoCloseTime}
+              onChange={(e) => setAutoCloseTime(e.target.value)}
+              className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 py-2 text-sm font-mono text-slate-900"
+            />
+            <p className="mt-1 text-xs text-slate-500">
+              Heure par défaut (23:59) à laquelle une arrivée sans départ passe en statut « Départ manquant ».
             </p>
           </div>
         </div>

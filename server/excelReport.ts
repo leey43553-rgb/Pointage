@@ -36,6 +36,7 @@ const FRENCH_WEEKDAYS = [
 export type DailyStatus =
   | 'Présent'
   | 'En retard'
+  | 'Départ manquant'
   | 'Absent'
   | 'Week-end'
   | 'Férié'
@@ -56,6 +57,7 @@ export interface DailyReportRow {
   status: DailyStatus;
   hasCheckinPhoto: boolean;
   hasCheckoutPhoto: boolean;
+  isCorrected: boolean;
   observation: string;
 }
 
@@ -69,6 +71,9 @@ export interface MonthlyEmployeeSummary {
   days_present: number;
   days_absent: number;
   days_late: number;
+  missing_checkouts: number;
+  missing_punches: number;
+  corrected_punches: number;
   total_late_minutes: number;
   total_worked_minutes: number;
   attendance_rate: number;
@@ -148,7 +153,12 @@ function formatMinutesReadable(totalMinutes: number): string {
 
 export function computeMonthlyEmployeeSummaries(
   month: string,
-  employees: Array<Pick<EmployeeRow, 'id' | 'first_name' | 'last_name' | 'job_title' | 'is_active'>>,
+  employees: Array<
+    Pick<
+      EmployeeRow,
+      'id' | 'first_name' | 'last_name' | 'job_title' | 'is_active' | 'shift_start' | 'shift_end' | 'grace_minutes'
+    >
+  >,
   attendanceRecords: AttendanceRow[],
   settings: SettingsRow
 ): MonthlyEmployeeSummary[] {
@@ -160,10 +170,9 @@ export function computeMonthlyEmployeeSummaries(
   const holidays = parsePublicHolidays(settings.public_holidays);
   const holidayMap = new Map<string, PublicHolidayEntry>(holidays.map((h) => [h.date, h]));
 
-  const officialStart = parseTimeParts(settings.official_start_time || '09:00');
-  const officialStartMins = officialStart.hours * 60 + officialStart.minutes;
-  const graceMinutes = Number(settings.grace_minutes || 0);
-  const cutoffMins = officialStartMins + graceMinutes;
+  const defaultOfficialStart = parseTimeParts(settings.official_start_time || '09:00');
+  const defaultOfficialStartMins = defaultOfficialStart.hours * 60 + defaultOfficialStart.minutes;
+  const defaultGraceMinutes = Number(settings.grace_minutes || 0);
 
   const attendanceByEmpAndDate = new Map<string, AttendanceRow>();
   for (const rec of attendanceRecords) {
@@ -171,10 +180,25 @@ export function computeMonthlyEmployeeSummaries(
   }
 
   return employees.map((emp) => {
+    const empStart =
+      emp.shift_start && /^\d{2}:\d{2}$/.test(emp.shift_start)
+        ? parseTimeParts(emp.shift_start)
+        : null;
+    const officialStartMins = empStart
+      ? empStart.hours * 60 + empStart.minutes
+      : defaultOfficialStartMins;
+    const graceMinutes =
+      emp.grace_minutes !== null && emp.grace_minutes !== undefined
+        ? Number(emp.grace_minutes)
+        : defaultGraceMinutes;
+    const cutoffMins = officialStartMins + graceMinutes;
+
     let expectedWorkingDays = 0;
     let daysPresent = 0;
     let daysAbsent = 0;
     let daysLate = 0;
+    let missingCheckouts = 0;
+    let correctedPunches = 0;
     let totalLateMinutes = 0;
     let totalWorkedMinutes = 0;
     const dailyRows: DailyReportRow[] = [];
@@ -209,10 +233,14 @@ export function computeMonthlyEmployeeSummaries(
           daysLate++;
           totalLateMinutes += lateMins;
         }
+        if (att.is_corrected === 1) {
+          correctedPunches++;
+        }
 
         let coHours: number | null = null;
         let coMinutes: number | null = null;
         let missingCheckout = false;
+        let isClosedMissingCheckout = false;
         let workedMins: number | null = null;
 
         if (att.checkout_time) {
@@ -224,12 +252,33 @@ export function computeMonthlyEmployeeSummaries(
           totalWorkedMinutes += workedMins;
         } else {
           missingCheckout = true;
+          isClosedMissingCheckout = att.checkout_missing === 1 || dateStr < todayStr;
+          if (isClosedMissingCheckout) {
+            missingCheckouts++;
+          }
         }
 
         const obsParts: string[] = [];
         if (holiday?.label) obsParts.push(holiday.label);
         if (isLate) obsParts.push(`Retard de ${lateMins} min`);
-        if (missingCheckout) obsParts.push('Départ non pointé (heures non comptées)');
+        if (isClosedMissingCheckout) {
+          obsParts.push('Départ manquant (heures non comptées)');
+        } else if (missingCheckout) {
+          obsParts.push('Départ non pointé');
+        }
+        if (att.is_corrected === 1) {
+          obsParts.push(
+            att.last_correction_reason
+              ? `Corrigé : ${att.last_correction_reason}`
+              : 'Pointage corrigé'
+          );
+        }
+
+        const rowStatus: DailyStatus = isClosedMissingCheckout
+          ? 'Départ manquant'
+          : isLate
+          ? 'En retard'
+          : 'Présent';
 
         dailyRows.push({
           dateStr,
@@ -242,9 +291,10 @@ export function computeMonthlyEmployeeSummaries(
           missingCheckout,
           workedMinutes: workedMins,
           lateMinutes: lateMins,
-          status: isLate ? 'En retard' : 'Présent',
+          status: rowStatus,
           hasCheckinPhoto: Boolean(att.checkin_photo || att.checkin_photo_id),
           hasCheckoutPhoto: Boolean(att.checkout_photo || att.checkout_photo_id),
+          isCorrected: att.is_corrected === 1,
           observation: obsParts.join(' · '),
         });
       } else if (holiday) {
@@ -262,6 +312,7 @@ export function computeMonthlyEmployeeSummaries(
           status: holiday.type === 'leave' ? 'Congé' : 'Férié',
           hasCheckinPhoto: false,
           hasCheckoutPhoto: false,
+          isCorrected: false,
           observation: holiday.label || (holiday.type === 'leave' ? 'Jour de congé' : 'Jour férié'),
         });
       } else if (!isWorkingDay) {
@@ -279,6 +330,7 @@ export function computeMonthlyEmployeeSummaries(
           status: 'Week-end',
           hasCheckinPhoto: false,
           hasCheckoutPhoto: false,
+          isCorrected: false,
           observation: '',
         });
       } else if (isFutureDay) {
@@ -296,6 +348,7 @@ export function computeMonthlyEmployeeSummaries(
           status: 'À venir',
           hasCheckinPhoto: false,
           hasCheckoutPhoto: false,
+          isCorrected: false,
           observation: '',
         });
       } else {
@@ -314,6 +367,7 @@ export function computeMonthlyEmployeeSummaries(
           status: 'Absent',
           hasCheckinPhoto: false,
           hasCheckoutPhoto: false,
+          isCorrected: false,
           observation: 'Aucun pointage enregistré',
         });
       }
@@ -334,6 +388,9 @@ export function computeMonthlyEmployeeSummaries(
       days_present: daysPresent,
       days_absent: daysAbsent,
       days_late: daysLate,
+      missing_checkouts: missingCheckouts,
+      missing_punches: daysAbsent + missingCheckouts,
+      corrected_punches: correctedPunches,
       total_late_minutes: totalLateMinutes,
       total_worked_minutes: totalWorkedMinutes,
       attendance_rate: rate,
@@ -446,19 +503,19 @@ export async function generateMonthlyExcelBuffer(options: {
       views: [{ state: 'frozen', ySplit: summaryHeaderRowNum }],
     });
 
-    summarySheet.mergeCells('A1:J1');
+    summarySheet.mergeCells('A1:L1');
     const titleCell = summarySheet.getCell('A1');
     titleCell.value = safeExcelText(`${companyName || 'Mon Entreprise'} — Rapport mensuel de présence`);
     titleCell.font = { bold: true, size: 15, color: { argb: 'FF1E3A8A' } };
     summarySheet.getRow(1).height = 24;
 
-    summarySheet.mergeCells('A2:J2');
+    summarySheet.mergeCells('A2:L2');
     const metaCell = summarySheet.getCell('A2');
     metaCell.value = `Période : ${monthLabel}   |   Généré le : ${generatedLabel}`;
     metaCell.font = { bold: true, size: 11, color: { argb: 'FF334155' } };
     summarySheet.getRow(2).height = 20;
 
-    summarySheet.mergeCells('A3:J3');
+    summarySheet.mergeCells('A3:L3');
     const subCell = summarySheet.getCell('A3');
     subCell.value = `Effectif inclus : ${summaries.length} employé${summaries.length > 1 ? 's' : ''}`;
     subCell.font = { italic: true, size: 10, color: { argb: 'FF64748B' } };
@@ -473,6 +530,8 @@ export async function generateMonthlyExcelBuffer(options: {
       'Nombre de retards',
       'Retard cumulé (h:min)',
       'Heures travaillées (h:min)',
+      'Pointages manquants',
+      'Pointages corrigés',
       'Taux de présence (%)',
     ];
 
@@ -497,6 +556,8 @@ export async function generateMonthlyExcelBuffer(options: {
     let sumLateCount = 0;
     let sumLateMins = 0;
     let sumWorkedMins = 0;
+    let sumMissing = 0;
+    let sumCorrected = 0;
 
     summaries.forEach((emp, idx) => {
       const rowNum = summaryHeaderRowNum + 1 + idx;
@@ -509,6 +570,8 @@ export async function generateMonthlyExcelBuffer(options: {
       sumLateCount += emp.days_late;
       sumLateMins += emp.total_late_minutes;
       sumWorkedMins += emp.total_worked_minutes;
+      sumMissing += emp.missing_punches;
+      sumCorrected += emp.corrected_punches;
 
       const values: Array<string | number> = [
         safeExcelText(emp.last_name),
@@ -520,6 +583,8 @@ export async function generateMonthlyExcelBuffer(options: {
         emp.days_late,
         emp.total_late_minutes / 1440,
         emp.total_worked_minutes / 1440,
+        emp.missing_punches,
+        emp.corrected_punches,
         emp.expected_working_days > 0 ? emp.days_present / emp.expected_working_days : 0,
       ];
 
@@ -535,9 +600,16 @@ export async function generateMonthlyExcelBuffer(options: {
                 ? 'FF991B1B'
                 : colIdx === 6 && emp.days_late > 0
                 ? 'FF9A3412'
+                : colIdx === 9 && emp.missing_punches > 0
+                ? 'FFB45309'
+                : colIdx === 10 && emp.corrected_punches > 0
+                ? 'FF1E40AF'
                 : 'FF0F172A',
           },
-          bold: colIdx <= 1 || (colIdx === 5 && emp.days_absent > 0),
+          bold:
+            colIdx <= 1 ||
+            (colIdx === 5 && emp.days_absent > 0) ||
+            (colIdx === 9 && emp.missing_punches > 0),
         };
         cell.alignment = {
           vertical: 'middle',
@@ -549,7 +621,7 @@ export async function generateMonthlyExcelBuffer(options: {
         if (colIdx === 7 || colIdx === 8) {
           cell.numFmt = '[h]:mm';
         }
-        if (colIdx === 9) {
+        if (colIdx === 11) {
           cell.numFmt = '0.0%';
         }
       });
@@ -571,6 +643,8 @@ export async function generateMonthlyExcelBuffer(options: {
       sumLateCount,
       sumLateMins / 1440,
       sumWorkedMins / 1440,
+      sumMissing,
+      sumCorrected,
       overallRate,
     ];
 
@@ -587,14 +661,14 @@ export async function generateMonthlyExcelBuffer(options: {
       if (colIdx === 7 || colIdx === 8) {
         cell.numFmt = '[h]:mm';
       }
-      if (colIdx === 9) {
+      if (colIdx === 11) {
         cell.numFmt = '0.0%';
       }
     });
 
     applyAutoColumnWidths(
       summarySheet,
-      [18, 16, 18, 16, 15, 16, 17, 20, 22, 18],
+      [18, 16, 18, 16, 15, 16, 17, 20, 22, 18, 18, 18],
       summaryHeaderRowNum
     );
   }
@@ -617,13 +691,13 @@ export async function generateMonthlyExcelBuffer(options: {
     });
 
     // Header block (rows 1..4)
-    sheet.mergeCells('A1:J1');
+    sheet.mergeCells('A1:K1');
     const empTitle = sheet.getCell('A1');
     empTitle.value = safeExcelText(`${emp.last_name.toUpperCase()} ${emp.first_name} — Fiche mensuelle de pointage`);
     empTitle.font = { bold: true, size: 14, color: { argb: 'FF1E3A8A' } };
     sheet.getRow(1).height = 22;
 
-    sheet.mergeCells('A2:J2');
+    sheet.mergeCells('A2:K2');
     const empMeta = sheet.getCell('A2');
     empMeta.value = safeExcelText(
       `Entreprise : ${companyName || 'Mon Entreprise'}   |   Poste : ${emp.job_title || 'Non renseigné'}   |   Mois : ${monthLabel}   |   Généré le : ${generatedLabel}`
@@ -632,12 +706,14 @@ export async function generateMonthlyExcelBuffer(options: {
     sheet.getRow(2).height = 18;
 
     // Small summary bar in rows 3-4
-    sheet.mergeCells('A3:J3');
+    sheet.mergeCells('A3:K3');
     const summaryLine = sheet.getCell('A3');
     summaryLine.value =
-      `Résumé : Jours présents : ${emp.days_present} / ${emp.expected_working_days}   ·   ` +
+      `Résumé : Présents : ${emp.days_present} / ${emp.expected_working_days}   ·   ` +
       `Absences : ${emp.days_absent}   ·   ` +
       `Retards : ${emp.days_late} (${formatMinutesReadable(emp.total_late_minutes)})   ·   ` +
+      `Pointages manquants : ${emp.missing_punches}   ·   ` +
+      `Corrigés : ${emp.corrected_punches}   ·   ` +
       `Total heures : ${formatMinutesReadable(emp.total_worked_minutes)}   ·   ` +
       `Taux : ${emp.attendance_rate}%`;
     summaryLine.font = { bold: true, size: 10, color: { argb: 'FF0F172A' } };
@@ -658,6 +734,7 @@ export async function generateMonthlyExcelBuffer(options: {
       'Statut',
       'Photo arrivée',
       'Photo départ',
+      'Corrigé',
       'Observation',
     ];
 
@@ -671,7 +748,7 @@ export async function generateMonthlyExcelBuffer(options: {
       cell.border = THIN_BORDER;
       cell.alignment = {
         vertical: 'middle',
-        horizontal: i <= 1 || i === 9 ? 'left' : 'center',
+        horizontal: i <= 1 || i === 10 ? 'left' : 'center',
         wrapText: true,
       };
     });
@@ -687,6 +764,9 @@ export async function generateMonthlyExcelBuffer(options: {
       if (d.status === 'Absent') {
         rowFillArgb = 'FFFEE2E2'; // light red
         statusFontColor = 'FF991B1B';
+      } else if (d.status === 'Départ manquant') {
+        rowFillArgb = 'FFFEF3C7'; // light amber
+        statusFontColor = 'FFB45309';
       } else if (d.status === 'En retard') {
         rowFillArgb = 'FFFFEDD5'; // light orange
         statusFontColor = 'FF9A3412';
@@ -716,7 +796,7 @@ export async function generateMonthlyExcelBuffer(options: {
 
       const cOut = row.getCell(4);
       if (d.missingCheckout) {
-        cOut.value = 'Départ non pointé';
+        cOut.value = d.status === 'Départ manquant' ? 'Départ manquant' : 'Départ non pointé';
       } else if (d.checkoutHours !== null && d.checkoutMinutes !== null) {
         cOut.value = toExcelTimeDate(d.checkoutHours, d.checkoutMinutes);
         cOut.numFmt = 'hh:mm';
@@ -750,15 +830,18 @@ export async function generateMonthlyExcelBuffer(options: {
       const cPhotoOut = row.getCell(9);
       cPhotoOut.value = d.hasCheckoutPhoto ? 'Oui' : 'Non';
 
-      const cObs = row.getCell(10);
+      const cCorrected = row.getCell(10);
+      cCorrected.value = d.isCorrected ? 'Oui' : 'Non';
+
+      const cObs = row.getCell(11);
       cObs.value = d.observation ? safeExcelText(d.observation) : '-';
 
-      for (let colIdx = 1; colIdx <= 10; colIdx++) {
+      for (let colIdx = 1; colIdx <= 11; colIdx++) {
         const cell = row.getCell(colIdx);
         cell.border = THIN_BORDER;
         cell.alignment = {
           vertical: 'middle',
-          horizontal: colIdx <= 2 || colIdx === 10 ? 'left' : 'center',
+          horizontal: colIdx <= 2 || colIdx === 11 ? 'left' : 'center',
         };
         if (rowFillArgb) {
           cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: rowFillArgb } };
@@ -771,11 +854,16 @@ export async function generateMonthlyExcelBuffer(options: {
                 ? statusFontColor
                 : colIdx === 4 && d.missingCheckout
                 ? 'FFB45309'
+                : colIdx === 10 && d.isCorrected
+                ? 'FF1E40AF'
                 : d.status === 'Week-end'
                 ? 'FF475569'
                 : 'FF0F172A',
           },
-          bold: colIdx === 7 || (colIdx === 4 && d.missingCheckout),
+          bold:
+            colIdx === 7 ||
+            (colIdx === 4 && d.missingCheckout) ||
+            (colIdx === 10 && d.isCorrected),
         };
       }
     });
@@ -792,13 +880,14 @@ export async function generateMonthlyExcelBuffer(options: {
       'TOTAUX DU MOIS',
       `${emp.expected_working_days} j ouvrables`,
       `Présents : ${emp.days_present} j`,
-      `Absences : ${emp.days_absent} j`,
+      `Manquants : ${emp.missing_punches}`,
       emp.total_worked_minutes / 1440,
       emp.total_late_minutes / 1440,
       `Retards : ${emp.days_late} (${emp.attendance_rate}%)`,
       `${checkinPhotoCount} Oui`,
       `${checkoutPhotoCount} Oui`,
-      '-',
+      `${emp.corrected_punches} corrigé(s)`,
+      `Absences : ${emp.days_absent} · Départs manquants : ${emp.missing_checkouts}`,
     ];
 
     totalValues.forEach((val, i) => {
@@ -809,7 +898,7 @@ export async function generateMonthlyExcelBuffer(options: {
       cell.border = TOTALS_BORDER;
       cell.alignment = {
         vertical: 'middle',
-        horizontal: i === 0 ? 'left' : 'center',
+        horizontal: i === 0 || i === 10 ? 'left' : 'center',
       };
       if (i === 4 || i === 5) {
         cell.numFmt = '[h]:mm';
@@ -828,7 +917,7 @@ export async function generateMonthlyExcelBuffer(options: {
     sigEmpTitle.alignment = { horizontal: 'center', vertical: 'middle' };
     sigEmpTitle.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
 
-    sheet.mergeCells(`F${sigTitleRowNum}:J${sigTitleRowNum}`);
+    sheet.mergeCells(`F${sigTitleRowNum}:K${sigTitleRowNum}`);
     const sigAdminTitle = sheet.getCell(`F${sigTitleRowNum}`);
     sigAdminTitle.value = 'Signature du responsable';
     sigAdminTitle.font = { bold: true, size: 10, color: { argb: 'FF1E3A8A' } };
@@ -836,7 +925,7 @@ export async function generateMonthlyExcelBuffer(options: {
     sigAdminTitle.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
 
     sheet.mergeCells(`A${sigBoxRowNum}:D${sigBoxRowNum}`);
-    sheet.mergeCells(`F${sigBoxRowNum}:J${sigBoxRowNum}`);
+    sheet.mergeCells(`F${sigBoxRowNum}:K${sigBoxRowNum}`);
     sheet.getRow(sigBoxRowNum).height = 42;
 
     sheet.mergeCells(`A${sigDateRowNum}:D${sigDateRowNum}`);
@@ -845,21 +934,21 @@ export async function generateMonthlyExcelBuffer(options: {
     sigEmpDate.font = { size: 9, color: { argb: 'FF475569' } };
     sigEmpDate.alignment = { horizontal: 'center', vertical: 'middle' };
 
-    sheet.mergeCells(`F${sigDateRowNum}:J${sigDateRowNum}`);
+    sheet.mergeCells(`F${sigDateRowNum}:K${sigDateRowNum}`);
     const sigAdminDate = sheet.getCell(`F${sigDateRowNum}`);
     sigAdminDate.value = 'Date : ____ / ____ / ________';
     sigAdminDate.font = { size: 9, color: { argb: 'FF475569' } };
     sigAdminDate.alignment = { horizontal: 'center', vertical: 'middle' };
 
     for (const r of [sigTitleRowNum, sigBoxRowNum, sigDateRowNum]) {
-      for (const c of [1, 2, 3, 4, 6, 7, 8, 9, 10]) {
+      for (const c of [1, 2, 3, 4, 6, 7, 8, 9, 10, 11]) {
         sheet.getRow(r).getCell(c).border = THIN_BORDER;
       }
     }
 
     applyAutoColumnWidths(
       sheet,
-      [14, 14, 16, 20, 18, 14, 14, 14, 14, 28],
+      [14, 14, 16, 20, 18, 14, 18, 14, 14, 12, 30],
       empHeaderRowNum
     );
   }

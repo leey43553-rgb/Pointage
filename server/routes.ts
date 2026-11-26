@@ -28,12 +28,28 @@ import {
   updateAppFileConfig,
   type AdminRow,
   type AttendanceRow,
+  type CorrectionLogRow,
+  type CorrectionRequestRow,
   type EmployeeRow,
   type PhotoRequirement,
   type PhotoRow,
   type PublicHolidayEntry,
   type SettingsRow,
 } from './db.ts';
+import {
+  computeCheckinLateness,
+  computeLiveAlertsSummary,
+  computeWorkedMinutes,
+  computeYesterdayMissingPunch,
+  formatAttendanceSnapshot,
+  getEffectiveEmployeeSchedule,
+  isDateExpectedWorkingDay,
+  isValidHHMM,
+  normalizeHHMM,
+  parseTimeToMinutes,
+  runAutoCloseMissingCheckouts,
+  writeCorrectionLog,
+} from './attendanceLogic.ts';
 import {
   computeMonthlyEmployeeSummaries,
   generateMonthlyExcelBuffer,
@@ -118,13 +134,6 @@ function isNetworkAllowed(clientIp: string, settings: SettingsRow): boolean {
   const prefix = (settings.allowed_network_prefix || '').trim();
   if (!prefix) return true;
   return clientIp.startsWith(prefix);
-}
-
-function parseTimeToMinutes(hhmm: string): number {
-  const parts = hhmm.split(':');
-  const h = Number(parts[0] || 0);
-  const m = Number(parts[1] || 0);
-  return h * 60 + m;
 }
 
 function getAttemptLockRemaining(key: string): number {
@@ -252,6 +261,8 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
     clearAttempts(ipKey);
     clearAttempts(codeKey);
 
+    runAutoCloseMissingCheckouts();
+
     const today = getLocalDateString();
     const todayAttendance = db
       .prepare('SELECT * FROM attendance WHERE employee_id = ? AND work_date = ?')
@@ -267,6 +278,9 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
     });
 
     const settings = getSettings();
+    const effectiveSchedule = getEffectiveEmployeeSchedule(employee, settings);
+    const missingYesterday = computeYesterdayMissingPunch(employee, settings);
+
     res.json({
       token,
       employee: {
@@ -274,8 +288,12 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
         first_name: employee.first_name,
         last_name: employee.last_name,
         job_title: employee.job_title,
+        shift_start: effectiveSchedule.shift_start,
+        shift_end: effectiveSchedule.shift_end,
+        grace_minutes: effectiveSchedule.grace_minutes,
       },
       today_attendance: todayAttendance || null,
+      missing_yesterday: missingYesterday,
       photo_requirement: settings.photo_requirement || 'both',
       server_time: getLocalTimeString(),
       server_date: today,
@@ -340,6 +358,7 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
 
   // ---------------- EMPLOYEE ROUTES ----------------
   router.get('/employee/me', requireEmployee, (req: AuthenticatedRequest, res: Response) => {
+    runAutoCloseMissingCheckouts();
     const emp = req.employeeUser!;
     const today = getLocalDateString();
     const todayAttendance = db
@@ -347,14 +366,21 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
       .get(emp.id, today) as AttendanceRow | undefined;
 
     const settings = getSettings();
+    const effectiveSchedule = getEffectiveEmployeeSchedule(emp, settings);
+    const missingYesterday = computeYesterdayMissingPunch(emp, settings);
+
     res.json({
       employee: {
         id: emp.id,
         first_name: emp.first_name,
         last_name: emp.last_name,
         job_title: emp.job_title,
+        shift_start: effectiveSchedule.shift_start,
+        shift_end: effectiveSchedule.shift_end,
+        grace_minutes: effectiveSchedule.grace_minutes,
       },
       today_attendance: todayAttendance || null,
+      missing_yesterday: missingYesterday,
       photo_requirement: settings.photo_requirement || 'both',
       server_time: getLocalTimeString(),
       server_date: today,
@@ -362,6 +388,7 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
   });
 
   router.get('/employee/history', requireEmployee, (req: AuthenticatedRequest, res: Response) => {
+    runAutoCloseMissingCheckouts();
     const emp = req.employeeUser!;
     const start = new Date();
     start.setDate(start.getDate() - 29);
@@ -376,6 +403,105 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
       .all(emp.id, fromDate) as AttendanceRow[];
 
     res.json({ records: rows, from_date: fromDate, to_date: getLocalDateString() });
+  });
+
+  router.get('/employee/correction-requests', requireEmployee, (req: AuthenticatedRequest, res: Response) => {
+    const emp = req.employeeUser!;
+    const rows = db
+      .prepare(
+        `SELECT * FROM correction_requests
+         WHERE employee_id = ?
+         ORDER BY id DESC LIMIT 50`
+      )
+      .all(emp.id) as CorrectionRequestRow[];
+    res.json({ requests: rows });
+  });
+
+  router.post('/employee/correction-requests', requireEmployee, (req: AuthenticatedRequest, res: Response) => {
+    const emp = req.employeeUser!;
+    const todayStr = getLocalDateString();
+    const workDate = typeof req.body?.work_date === 'string' ? req.body.work_date.trim() : '';
+    const punchType =
+      req.body?.punch_type === 'checkout'
+        ? 'checkout'
+        : req.body?.punch_type === 'checkin'
+        ? 'checkin'
+        : null;
+    const requestedTime =
+      typeof req.body?.requested_time === 'string' ? req.body.requested_time.trim() : '';
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(workDate) || workDate > todayStr) {
+      res.status(400).json({ error: 'Veuillez choisir une date valide (passée ou actuelle).' });
+      return;
+    }
+    if (!punchType) {
+      res.status(400).json({ error: 'Veuillez indiquer si vous avez oublié l’arrivée ou le départ.' });
+      return;
+    }
+    if (!isValidHHMM(requestedTime)) {
+      res.status(400).json({ error: 'Veuillez saisir une heure valide au format HH:MM.' });
+      return;
+    }
+    if (reason.length < 3 || reason.length > 500) {
+      res.status(400).json({ error: 'Veuillez préciser un motif (entre 3 et 500 caractères).' });
+      return;
+    }
+
+    const existingPending = db
+      .prepare(
+        `SELECT id FROM correction_requests
+         WHERE employee_id = ? AND work_date = ? AND punch_type = ? AND status = 'pending'`
+      )
+      .get(emp.id, workDate, punchType);
+    if (existingPending) {
+      res.status(409).json({
+        error: 'Une demande en attente existe déjà pour cette date et ce type de pointage.',
+      });
+      return;
+    }
+
+    const att = db
+      .prepare('SELECT * FROM attendance WHERE employee_id = ? AND work_date = ?')
+      .get(emp.id, workDate) as AttendanceRow | undefined;
+
+    if (
+      punchType === 'checkout' &&
+      att?.checkin_time &&
+      parseTimeToMinutes(requestedTime) < parseTimeToMinutes(att.checkin_time)
+    ) {
+      res.status(400).json({
+        error: "L'heure de départ demandée ne peut pas être antérieure à votre arrivée pointée.",
+      });
+      return;
+    }
+    if (
+      punchType === 'checkin' &&
+      att?.checkout_time &&
+      parseTimeToMinutes(requestedTime) > parseTimeToMinutes(att.checkout_time)
+    ) {
+      res.status(400).json({
+        error: "L'heure d'arrivée demandée ne peut pas être postérieure à votre départ pointé.",
+      });
+      return;
+    }
+
+    const nowIso = getLocalDateTimeIso();
+    const info = db
+      .prepare(
+        `INSERT INTO correction_requests (employee_id, work_date, punch_type, requested_time, reason, status, created_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?)`
+      )
+      .run(emp.id, workDate, punchType, requestedTime, reason, nowIso);
+
+    const created = db
+      .prepare('SELECT * FROM correction_requests WHERE id = ?')
+      .get(info.lastInsertRowid) as CorrectionRequestRow;
+
+    res.status(201).json({
+      request: created,
+      message: 'Votre demande de correction a bien été envoyée au responsable.',
+    });
   });
 
   router.post(
@@ -436,12 +562,12 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
         }
       }
 
-      const officialStartMins = parseTimeToMinutes(settings.official_start_time);
-      const cutoffMins = officialStartMins + (settings.grace_minutes || 0);
-      const arrivalMins = now.getHours() * 60 + now.getMinutes();
-
-      const isLate = arrivalMins > cutoffMins ? 1 : 0;
-      const lateMinutes = isLate ? Math.max(1, arrivalMins - officialStartMins) : 0;
+      const effSchedule = getEffectiveEmployeeSchedule(emp, settings);
+      const { isLate, lateMinutes } = computeCheckinLateness(
+        timeStr,
+        effSchedule.shift_start,
+        effSchedule.grace_minutes
+      );
 
       const fullName = `${emp.first_name} ${emp.last_name}`.trim();
 
@@ -579,7 +705,7 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
 
         db.prepare(
           `UPDATE attendance
-           SET checkout_time = ?, checkout_ip = ?, checkout_photo = ?, checkout_photo_id = ?, worked_minutes = ?
+           SET checkout_time = ?, checkout_ip = ?, checkout_photo = ?, checkout_photo_id = ?, worked_minutes = ?, checkout_missing = 0, auto_closed_at = NULL
            WHERE id = ?`
         ).run(
           timeStr,
@@ -624,18 +750,34 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
 
   router.get('/admin/employees/list', requireAdmin, (_req: AuthenticatedRequest, res: Response) => {
     const rows = db
-      .prepare('SELECT id, first_name, last_name, job_title, is_active FROM employees ORDER BY last_name ASC, first_name ASC')
+      .prepare(
+        'SELECT id, first_name, last_name, job_title, is_active, shift_start, shift_end, grace_minutes FROM employees ORDER BY last_name ASC, first_name ASC'
+      )
       .all();
     res.json({ employees: rows });
   });
 
+  router.get('/admin/alerts', requireAdmin, (_req: AuthenticatedRequest, res: Response) => {
+    res.json(computeLiveAlertsSummary());
+  });
+
   router.get('/admin/dashboard/today', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
+    runAutoCloseMissingCheckouts();
+
+    const now = new Date();
+    const todayStr = getLocalDateString(now);
+    const nowMins = now.getHours() * 60 + now.getMinutes();
     const dateParam = typeof req.query.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date)
       ? req.query.date
-      : getLocalDateString();
+      : todayStr;
+
+    const settings = getSettings();
+    const isWorkingDate = isDateExpectedWorkingDay(dateParam, settings);
 
     const employees = db
-      .prepare('SELECT id, first_name, last_name, job_title, is_active FROM employees WHERE is_active = 1 ORDER BY last_name ASC, first_name ASC')
+      .prepare(
+        'SELECT id, first_name, last_name, job_title, is_active, shift_start, shift_end, grace_minutes FROM employees WHERE is_active = 1 ORDER BY last_name ASC, first_name ASC'
+      )
       .all() as Array<Omit<EmployeeRow, 'code' | 'created_at'>>;
 
     const records = db
@@ -650,21 +792,37 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
     let presentOnTimeCount = 0;
     let lateCount = 0;
     let absentCount = 0;
+    let unreportedCount = 0;
+    let missingCheckoutCount = 0;
 
     const list = employees.map((emp) => {
       const att = recordByEmp.get(emp.id) || null;
-      let status: 'present' | 'late' | 'absent' = 'absent';
+      const eff = getEffectiveEmployeeSchedule(emp, settings);
+      let status: 'present' | 'late' | 'unreported' | 'missing_checkout' | 'absent' = 'absent';
+
       if (att && att.checkin_time) {
-        if (att.is_late === 1) {
+        if (!att.checkout_time && (att.checkout_missing === 1 || dateParam < todayStr)) {
+          status = 'missing_checkout';
+          missingCheckoutCount++;
+        } else if (att.is_late === 1) {
           status = 'late';
           lateCount++;
         } else {
           status = 'present';
           presentOnTimeCount++;
         }
+      } else if (
+        dateParam === todayStr &&
+        isWorkingDate &&
+        nowMins > parseTimeToMinutes(eff.shift_start) + eff.grace_minutes
+      ) {
+        status = 'unreported';
+        unreportedCount++;
       } else {
+        status = 'absent';
         absentCount++;
       }
+
       return {
         attendance_id: att?.id || null,
         employee_id: emp.id,
@@ -676,6 +834,14 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
         checkout_time: att?.checkout_time || null,
         late_minutes: att?.late_minutes || 0,
         worked_minutes: att?.worked_minutes || 0,
+        checkout_missing: Boolean(
+          att && att.checkin_time && !att.checkout_time && (att.checkout_missing === 1 || dateParam < todayStr)
+        ),
+        is_corrected: Boolean(att?.is_corrected === 1),
+        last_correction_reason: att?.last_correction_reason || null,
+        shift_start: eff.shift_start,
+        shift_end: eff.shift_end,
+        grace_minutes: eff.grace_minutes,
         checkin_ip: att?.checkin_ip || null,
         checkout_ip: att?.checkout_ip || null,
         has_checkin_photo: Boolean(att?.checkin_photo || att?.checkin_photo_id),
@@ -685,20 +851,27 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
       };
     });
 
+    const alerts = computeLiveAlertsSummary();
+
     res.json({
       date: dateParam,
       summary: {
         total_active: employees.length,
-        present_total: presentOnTimeCount + lateCount,
+        present_total: presentOnTimeCount + lateCount + missingCheckoutCount,
         on_time: presentOnTimeCount,
         late: lateCount,
+        unreported: unreportedCount,
+        missing_checkout: missingCheckoutCount,
         absent: absentCount,
+        pending_requests: alerts.pending_requests,
       },
+      alerts,
       employees: list,
     });
   });
 
   router.get('/admin/dashboard/monthly', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
+    runAutoCloseMissingCheckouts();
     const now = new Date();
     const defaultMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
     const month = typeof req.query.month === 'string' && /^\d{4}-\d{2}$/.test(req.query.month)
@@ -707,7 +880,8 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
 
     const employeeId = req.query.employeeId ? Number(req.query.employeeId) : null;
 
-    let empSql = 'SELECT id, first_name, last_name, job_title, is_active FROM employees';
+    let empSql =
+      'SELECT id, first_name, last_name, job_title, is_active, shift_start, shift_end, grace_minutes FROM employees';
     const empParams: Array<number> = [];
     if (employeeId && Number.isFinite(employeeId)) {
       empSql += ' WHERE id = ?';
@@ -728,6 +902,7 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
   });
 
   router.get('/admin/export/excel', requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
+    runAutoCloseMissingCheckouts();
     const now = new Date();
     const defaultMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
     const month = typeof req.query.month === 'string' && /^\d{4}-\d{2}$/.test(req.query.month)
@@ -737,7 +912,8 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
     const employeeId = req.query.employeeId ? Number(req.query.employeeId) : null;
     const isSingleEmployee = Boolean(employeeId && Number.isFinite(employeeId));
 
-    let empSql = 'SELECT id, first_name, last_name, job_title, is_active FROM employees';
+    let empSql =
+      'SELECT id, first_name, last_name, job_title, is_active, shift_start, shift_end, grace_minutes FROM employees';
     const empParams: Array<number> = [];
     if (isSingleEmployee && employeeId !== null) {
       empSql += ' WHERE id = ?';
@@ -779,6 +955,7 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
   });
 
   router.get('/admin/attendance', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
+    runAutoCloseMissingCheckouts();
     const today = getLocalDateString();
     const startObj = new Date();
     startObj.setDate(1);
@@ -811,7 +988,11 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
         a.checkout_photo_id,
         a.is_late,
         a.late_minutes,
-        a.worked_minutes
+        a.worked_minutes,
+        a.checkout_missing,
+        a.auto_closed_at,
+        a.is_corrected,
+        a.last_correction_reason
       FROM attendance a
       JOIN employees e ON e.id = a.employee_id
       WHERE a.work_date >= ? AND a.work_date <= ?
@@ -826,12 +1007,494 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
       sql += ' AND a.is_late = 1';
     } else if (status === 'on_time') {
       sql += ' AND a.is_late = 0';
+    } else if (status === 'missing_checkout') {
+      sql += ' AND a.checkin_time IS NOT NULL AND a.checkout_time IS NULL AND (a.checkout_missing = 1 OR a.work_date < ?)';
+      params.push(today);
+    } else if (status === 'corrected') {
+      sql += ' AND a.is_corrected = 1';
     }
 
     sql += ' ORDER BY a.work_date DESC, a.checkin_time DESC';
 
     const records = db.prepare(sql).all(...params);
     res.json({ from, to, records });
+  });
+
+  // Manual add or edit punch by manager/admin with mandatory reason
+  router.post('/admin/attendance/manual', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
+    const admin = req.adminUser!;
+    const employeeId = Number(req.body?.employee_id);
+    const workDate = typeof req.body?.work_date === 'string' ? req.body.work_date.trim() : '';
+    const checkinRaw = typeof req.body?.checkin_time === 'string' ? req.body.checkin_time.trim() : '';
+    const checkoutRaw = typeof req.body?.checkout_time === 'string' ? req.body.checkout_time.trim() : '';
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+
+    const todayStr = getLocalDateString();
+    const nowHHMM = getLocalTimeString().slice(0, 5);
+    const nowIso = getLocalDateTimeIso();
+
+    if (!Number.isFinite(employeeId)) {
+      res.status(400).json({ error: 'Veuillez sélectionner un employé.' });
+      return;
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(workDate) || workDate > todayStr) {
+      res.status(400).json({ error: 'La date doit être au format AAAA-MM-JJ (passée ou actuelle).' });
+      return;
+    }
+    if (!isValidHHMM(checkinRaw)) {
+      res.status(400).json({ error: "L'heure d'arrivée doit être au format HH:MM." });
+      return;
+    }
+    if (checkoutRaw && !isValidHHMM(checkoutRaw)) {
+      res.status(400).json({ error: "L'heure de départ doit être au format HH:MM." });
+      return;
+    }
+    if (checkoutRaw && parseTimeToMinutes(checkoutRaw) < parseTimeToMinutes(checkinRaw)) {
+      res.status(400).json({ error: "L'heure de départ ne peut pas être antérieure à l'arrivée." });
+      return;
+    }
+    if (reason.length < 3 || reason.length > 500) {
+      res.status(400).json({
+        error: 'Un motif explicatif obligatoire (3 à 500 caractères) est requis pour toute modification.',
+      });
+      return;
+    }
+
+    const emp = db
+      .prepare('SELECT * FROM employees WHERE id = ?')
+      .get(employeeId) as EmployeeRow | undefined;
+    if (!emp) {
+      res.status(404).json({ error: 'Employé introuvable.' });
+      return;
+    }
+
+    const settings = getSettings();
+    const effSchedule = getEffectiveEmployeeSchedule(emp, settings);
+    const checkinNorm = normalizeHHMM(checkinRaw);
+    const checkoutNorm = checkoutRaw ? normalizeHHMM(checkoutRaw) : null;
+
+    const { isLate, lateMinutes } = computeCheckinLateness(
+      checkinNorm,
+      effSchedule.shift_start,
+      effSchedule.grace_minutes
+    );
+    const workedMinutes = computeWorkedMinutes(checkinNorm, checkoutNorm);
+
+    const autoCloseTime = isValidHHMM(settings.auto_close_time)
+      ? settings.auto_close_time.trim()
+      : '23:59';
+    const shouldMarkMissingCheckout =
+      !checkoutNorm &&
+      (workDate < todayStr || (workDate === todayStr && nowHHMM >= autoCloseTime));
+
+    const existing = db
+      .prepare('SELECT * FROM attendance WHERE employee_id = ? AND work_date = ?')
+      .get(employeeId, workDate) as AttendanceRow | undefined;
+
+    const oldValue = formatAttendanceSnapshot(existing);
+    const empName = `${emp.first_name} ${emp.last_name}`.trim();
+    const clientIp = getClientIp(req);
+
+    let savedId = 0;
+
+    const saveTx = db.transaction(() => {
+      if (existing) {
+        db.prepare(
+          `UPDATE attendance
+           SET checkin_time = ?,
+               checkout_time = ?,
+               is_late = ?,
+               late_minutes = ?,
+               worked_minutes = ?,
+               checkout_missing = ?,
+               auto_closed_at = ?,
+               is_corrected = 1,
+               last_correction_reason = ?
+           WHERE id = ?`
+        ).run(
+          checkinNorm,
+          checkoutNorm,
+          isLate,
+          lateMinutes,
+          workedMinutes,
+          shouldMarkMissingCheckout ? 1 : 0,
+          shouldMarkMissingCheckout ? nowIso : null,
+          reason,
+          existing.id
+        );
+        savedId = existing.id;
+      } else {
+        const info = db
+          .prepare(
+            `INSERT INTO attendance (
+               employee_id, work_date, checkin_time, checkout_time, checkin_ip, checkout_ip,
+               is_late, late_minutes, worked_minutes, checkout_missing, auto_closed_at,
+               is_corrected, last_correction_reason, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+          )
+          .run(
+            employeeId,
+            workDate,
+            checkinNorm,
+            checkoutNorm,
+            `Manuel (${clientIp})`,
+            checkoutNorm ? `Manuel (${clientIp})` : null,
+            isLate,
+            lateMinutes,
+            workedMinutes,
+            shouldMarkMissingCheckout ? 1 : 0,
+            shouldMarkMissingCheckout ? nowIso : null,
+            reason,
+            nowIso
+          );
+        savedId = Number(info.lastInsertRowid);
+      }
+
+      const updated = db.prepare('SELECT * FROM attendance WHERE id = ?').get(savedId) as AttendanceRow;
+      const newValue = formatAttendanceSnapshot(updated);
+
+      writeCorrectionLog({
+        attendanceId: savedId,
+        employeeId: emp.id,
+        employeeName: empName,
+        workDate,
+        actionType: existing ? 'manual_edit' : 'manual_add',
+        actorAdminId: admin.id,
+        actorUsername: admin.username,
+        oldValue,
+        newValue,
+        reason,
+        createdAt: nowIso,
+      });
+    });
+
+    saveTx();
+
+    const record = db.prepare('SELECT * FROM attendance WHERE id = ?').get(savedId) as AttendanceRow;
+    res.json({
+      attendance: record,
+      message: existing
+        ? `Pointage de ${empName} mis à jour.`
+        : `Pointage manuel ajouté pour ${empName}.`,
+    });
+  });
+
+  // Correction requests queue for managers/admins
+  router.get('/admin/correction-requests', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
+    const status = typeof req.query.status === 'string' ? req.query.status : 'pending';
+    const employeeId = req.query.employeeId ? Number(req.query.employeeId) : null;
+
+    let sql = `
+      SELECT
+        cr.*,
+        e.first_name,
+        e.last_name,
+        e.job_title,
+        a.id as attendance_id,
+        a.checkin_time as current_checkin_time,
+        a.checkout_time as current_checkout_time,
+        a.checkout_missing as current_checkout_missing
+      FROM correction_requests cr
+      JOIN employees e ON e.id = cr.employee_id
+      LEFT JOIN attendance a ON a.employee_id = cr.employee_id AND a.work_date = cr.work_date
+      WHERE 1 = 1
+    `;
+    const params: Array<string | number> = [];
+
+    if (status === 'pending' || status === 'approved' || status === 'rejected') {
+      sql += ' AND cr.status = ?';
+      params.push(status);
+    }
+    if (employeeId && Number.isFinite(employeeId)) {
+      sql += ' AND cr.employee_id = ?';
+      params.push(employeeId);
+    }
+
+    sql += " ORDER BY CASE WHEN cr.status = 'pending' THEN 0 ELSE 1 END, cr.id DESC LIMIT 200";
+    const rows = db.prepare(sql).all(...params);
+    res.json({ requests: rows });
+  });
+
+  router.post(
+    '/admin/correction-requests/:id/approve',
+    requireAdmin,
+    (req: AuthenticatedRequest, res: Response) => {
+      const admin = req.adminUser!;
+      const reqId = Number(req.params.id);
+      if (!Number.isFinite(reqId)) {
+        res.status(400).json({ error: 'Identifiant de demande invalide.' });
+        return;
+      }
+
+      const corrReq = db
+        .prepare('SELECT * FROM correction_requests WHERE id = ?')
+        .get(reqId) as CorrectionRequestRow | undefined;
+      if (!corrReq) {
+        res.status(404).json({ error: 'Demande de correction introuvable.' });
+        return;
+      }
+      if (corrReq.status !== 'pending') {
+        res.status(409).json({ error: 'Cette demande a déjà été traitée.' });
+        return;
+      }
+
+      const overrideTimeRaw =
+        typeof req.body?.override_time === 'string' ? req.body.override_time.trim() : '';
+      const finalTime = overrideTimeRaw || corrReq.requested_time;
+      if (!isValidHHMM(finalTime)) {
+        res.status(400).json({ error: "L'heure saisie doit être au format HH:MM." });
+        return;
+      }
+
+      const reviewNote =
+        typeof req.body?.review_note === 'string' ? req.body.review_note.trim().slice(0, 500) : '';
+
+      const emp = db
+        .prepare('SELECT * FROM employees WHERE id = ?')
+        .get(corrReq.employee_id) as EmployeeRow | undefined;
+      if (!emp) {
+        res.status(404).json({ error: 'Employé introuvable.' });
+        return;
+      }
+
+      const existing = db
+        .prepare('SELECT * FROM attendance WHERE employee_id = ? AND work_date = ?')
+        .get(corrReq.employee_id, corrReq.work_date) as AttendanceRow | undefined;
+
+      const normalizedTime = normalizeHHMM(finalTime);
+      let newCheckin = existing?.checkin_time || null;
+      let newCheckout = existing?.checkout_time || null;
+
+      if (corrReq.punch_type === 'checkin') {
+        if (newCheckout && parseTimeToMinutes(normalizedTime) > parseTimeToMinutes(newCheckout)) {
+          res.status(400).json({
+            error: "L'heure d'arrivée ne peut pas être postérieure au départ déjà enregistré.",
+          });
+          return;
+        }
+        newCheckin = normalizedTime;
+      } else {
+        if (newCheckin && parseTimeToMinutes(normalizedTime) < parseTimeToMinutes(newCheckin)) {
+          res.status(400).json({
+            error: "L'heure de départ ne peut pas être antérieure à l'arrivée déjà enregistrée.",
+          });
+          return;
+        }
+        newCheckout = normalizedTime;
+      }
+
+      const settings = getSettings();
+      const effSchedule = getEffectiveEmployeeSchedule(emp, settings);
+      const { isLate, lateMinutes } = newCheckin
+        ? computeCheckinLateness(newCheckin, effSchedule.shift_start, effSchedule.grace_minutes)
+        : { isLate: 0, lateMinutes: 0 };
+      const workedMinutes = computeWorkedMinutes(newCheckin, newCheckout);
+      const nowIso = getLocalDateTimeIso();
+      const oldValue = formatAttendanceSnapshot(existing);
+      const empName = `${emp.first_name} ${emp.last_name}`.trim();
+      const effectiveReason = reviewNote
+        ? `${corrReq.reason} (Note responsable : ${reviewNote})`
+        : corrReq.reason;
+      const clientIp = getClientIp(req);
+
+      let attendanceId = existing?.id || 0;
+
+      const approveTx = db.transaction(() => {
+        if (existing) {
+          db.prepare(
+            `UPDATE attendance
+             SET checkin_time = ?,
+                 checkout_time = ?,
+                 is_late = ?,
+                 late_minutes = ?,
+                 worked_minutes = ?,
+                 checkout_missing = ?,
+                 auto_closed_at = ?,
+                 is_corrected = 1,
+                 last_correction_reason = ?
+             WHERE id = ?`
+          ).run(
+            newCheckin,
+            newCheckout,
+            isLate,
+            lateMinutes,
+            workedMinutes,
+            newCheckout ? 0 : existing.checkout_missing,
+            newCheckout ? null : existing.auto_closed_at,
+            effectiveReason,
+            existing.id
+          );
+          attendanceId = existing.id;
+        } else {
+          const info = db
+            .prepare(
+              `INSERT INTO attendance (
+                 employee_id, work_date, checkin_time, checkout_time, checkin_ip, checkout_ip,
+                 is_late, late_minutes, worked_minutes, checkout_missing, auto_closed_at,
+                 is_corrected, last_correction_reason, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, 1, ?, ?)`
+            )
+            .run(
+              emp.id,
+              corrReq.work_date,
+              newCheckin,
+              newCheckout,
+              newCheckin ? `Correction (${clientIp})` : null,
+              newCheckout ? `Correction (${clientIp})` : null,
+              isLate,
+              lateMinutes,
+              workedMinutes,
+              effectiveReason,
+              nowIso
+            );
+          attendanceId = Number(info.lastInsertRowid);
+        }
+
+        db.prepare(
+          `UPDATE correction_requests
+           SET status = 'approved',
+               reviewed_by_admin_id = ?,
+               reviewed_by_username = ?,
+               review_note = ?,
+               reviewed_at = ?
+           WHERE id = ?`
+        ).run(admin.id, admin.username, reviewNote || null, nowIso, reqId);
+
+        const updatedAtt = db
+          .prepare('SELECT * FROM attendance WHERE id = ?')
+          .get(attendanceId) as AttendanceRow;
+
+        writeCorrectionLog({
+          attendanceId,
+          employeeId: emp.id,
+          employeeName: empName,
+          workDate: corrReq.work_date,
+          actionType: 'request_approved',
+          actorAdminId: admin.id,
+          actorUsername: admin.username,
+          oldValue,
+          newValue: formatAttendanceSnapshot(updatedAtt),
+          reason: effectiveReason,
+          createdAt: nowIso,
+        });
+      });
+
+      approveTx();
+      res.json({ ok: true, message: `Demande de ${empName} approuvée et appliquée.` });
+    }
+  );
+
+  router.post(
+    '/admin/correction-requests/:id/reject',
+    requireAdmin,
+    (req: AuthenticatedRequest, res: Response) => {
+      const admin = req.adminUser!;
+      const reqId = Number(req.params.id);
+      if (!Number.isFinite(reqId)) {
+        res.status(400).json({ error: 'Identifiant de demande invalide.' });
+        return;
+      }
+
+      const corrReq = db
+        .prepare('SELECT * FROM correction_requests WHERE id = ?')
+        .get(reqId) as CorrectionRequestRow | undefined;
+      if (!corrReq) {
+        res.status(404).json({ error: 'Demande de correction introuvable.' });
+        return;
+      }
+      if (corrReq.status !== 'pending') {
+        res.status(409).json({ error: 'Cette demande a déjà été traitée.' });
+        return;
+      }
+
+      const reviewNote =
+        typeof req.body?.review_note === 'string' && req.body.review_note.trim()
+          ? req.body.review_note.trim().slice(0, 500)
+          : 'Demande refusée par le responsable';
+
+      const emp = db
+        .prepare('SELECT * FROM employees WHERE id = ?')
+        .get(corrReq.employee_id) as EmployeeRow | undefined;
+      const empName = emp ? `${emp.first_name} ${emp.last_name}`.trim() : `Employé #${corrReq.employee_id}`;
+      const existing = db
+        .prepare('SELECT * FROM attendance WHERE employee_id = ? AND work_date = ?')
+        .get(corrReq.employee_id, corrReq.work_date) as AttendanceRow | undefined;
+      const nowIso = getLocalDateTimeIso();
+      const punchLabel = corrReq.punch_type === 'checkin' ? 'Arrivée' : 'Départ';
+
+      const rejectTx = db.transaction(() => {
+        db.prepare(
+          `UPDATE correction_requests
+           SET status = 'rejected',
+               reviewed_by_admin_id = ?,
+               reviewed_by_username = ?,
+               review_note = ?,
+               reviewed_at = ?
+           WHERE id = ?`
+        ).run(admin.id, admin.username, reviewNote, nowIso, reqId);
+
+        writeCorrectionLog({
+          attendanceId: existing?.id || null,
+          employeeId: corrReq.employee_id,
+          employeeName: empName,
+          workDate: corrReq.work_date,
+          actionType: 'request_rejected',
+          actorAdminId: admin.id,
+          actorUsername: admin.username,
+          oldValue: formatAttendanceSnapshot(existing),
+          newValue: `Demande refusée (${punchLabel} ${corrReq.requested_time.slice(0, 5)})`,
+          reason: reviewNote,
+          createdAt: nowIso,
+        });
+      });
+
+      rejectTx();
+      res.json({ ok: true, message: `Demande de ${empName} refusée.` });
+    }
+  );
+
+  // Audit log of all corrections & auto-closures
+  router.get('/admin/correction-logs', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
+    const from =
+      typeof req.query.from === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.from)
+        ? req.query.from
+        : null;
+    const to =
+      typeof req.query.to === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.to)
+        ? req.query.to
+        : null;
+    const employeeId = req.query.employeeId ? Number(req.query.employeeId) : null;
+    const actionType = typeof req.query.actionType === 'string' ? req.query.actionType : 'all';
+
+    let sql = 'SELECT * FROM correction_logs WHERE 1 = 1';
+    const params: Array<string | number> = [];
+
+    if (from) {
+      sql += ' AND work_date >= ?';
+      params.push(from);
+    }
+    if (to) {
+      sql += ' AND work_date <= ?';
+      params.push(to);
+    }
+    if (employeeId && Number.isFinite(employeeId)) {
+      sql += ' AND employee_id = ?';
+      params.push(employeeId);
+    }
+    if (
+      actionType === 'manual_add' ||
+      actionType === 'manual_edit' ||
+      actionType === 'request_approved' ||
+      actionType === 'request_rejected' ||
+      actionType === 'auto_close'
+    ) {
+      sql += ' AND action_type = ?';
+      params.push(actionType);
+    }
+
+    sql += ' ORDER BY id DESC LIMIT 300';
+    const logs = db.prepare(sql).all(...params) as CorrectionLogRow[];
+    res.json({ logs });
   });
 
   // Protected admin-only photo route by photo ID (/api/photos/:id?thumb=1&download=1)
@@ -943,7 +1606,8 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
     const cutoffMins = officialStartMins + (settings.grace_minutes || 0);
     const WEEKDAY_LETTERS = ['D', 'L', 'M', 'M', 'J', 'V', 'S'];
 
-    let empSql = 'SELECT id, first_name, last_name, job_title, is_active FROM employees';
+    let empSql =
+      'SELECT id, first_name, last_name, job_title, is_active, shift_start, shift_end, grace_minutes FROM employees';
     const empParams: Array<number> = [];
     if (employeeId && Number.isFinite(employeeId)) {
       empSql += ' WHERE id = ?';
@@ -992,6 +1656,7 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
     }
 
     const employeeRows = employees.map((emp) => {
+      const effSchedule = getEffectiveEmployeeSchedule(emp, settings);
       const cells: Record<
         string,
         {
@@ -1013,12 +1678,13 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
       for (const d of days) {
         const att = attMap.get(`${emp.id}:${d.date}`);
         if (att && att.checkin_time) {
-          const ciMins = parseTimeToMinutes(att.checkin_time);
-          const isLate = ciMins > cutoffMins;
-          const lateMins = isLate ? Math.max(1, ciMins - officialStartMins) : 0;
-          const workedMins = att.checkout_time
-            ? Math.max(0, parseTimeToMinutes(att.checkout_time) - ciMins)
-            : 0;
+          const { isLate: isLateNum, lateMinutes: lateMins } = computeCheckinLateness(
+            att.checkin_time,
+            effSchedule.shift_start,
+            effSchedule.grace_minutes
+          );
+          const isLate = isLateNum === 1;
+          const workedMins = computeWorkedMinutes(att.checkin_time, att.checkout_time);
 
           cells[d.date] = {
             attendance_id: att.id,
@@ -1135,7 +1801,8 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
     const officialStartMins = parseTimeToMinutes(settings.official_start_time || '09:00');
     const cutoffMins = officialStartMins + (settings.grace_minutes || 0);
 
-    let empSql = 'SELECT id, first_name, last_name, job_title, is_active FROM employees';
+    let empSql =
+      'SELECT id, first_name, last_name, job_title, is_active, shift_start, shift_end, grace_minutes FROM employees';
     const empParams: Array<number> = [];
     if (employeeId && Number.isFinite(employeeId)) {
       empSql += ' WHERE id = ?';
@@ -1154,14 +1821,16 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
     const attByEmp = new Map<number, AttendanceRow>(records.map((r) => [r.employee_id, r]));
 
     const cards = employees.map((emp) => {
+      const effSchedule = getEffectiveEmployeeSchedule(emp, settings);
       const att = attByEmp.get(emp.id);
       if (att && att.checkin_time) {
-        const ciMins = parseTimeToMinutes(att.checkin_time);
-        const isLate = ciMins > cutoffMins;
-        const lateMins = isLate ? Math.max(1, ciMins - officialStartMins) : 0;
-        const workedMins = att.checkout_time
-          ? Math.max(0, parseTimeToMinutes(att.checkout_time) - ciMins)
-          : 0;
+        const { isLate: isLateNum, lateMinutes: lateMins } = computeCheckinLateness(
+          att.checkin_time,
+          effSchedule.shift_start,
+          effSchedule.grace_minutes
+        );
+        const isLate = isLateNum === 1;
+        const workedMins = computeWorkedMinutes(att.checkin_time, att.checkout_time);
         return {
           employee_id: emp.id,
           first_name: emp.first_name,
@@ -1408,9 +2077,32 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
     const lastName = typeof req.body?.last_name === 'string' ? req.body.last_name.trim() : '';
     const jobTitle = typeof req.body?.job_title === 'string' ? req.body.job_title.trim() : '';
 
+    const shiftStartRaw = typeof req.body?.shift_start === 'string' ? req.body.shift_start.trim() : '';
+    const shiftEndRaw = typeof req.body?.shift_end === 'string' ? req.body.shift_end.trim() : '';
+    const graceRaw = req.body?.grace_minutes;
+
     if (!firstName || !lastName) {
       res.status(400).json({ error: 'Le prénom et le nom sont obligatoires.' });
       return;
+    }
+
+    if (shiftStartRaw && !isValidHHMM(shiftStartRaw)) {
+      res.status(400).json({ error: "L'heure d'arrivée personnalisée doit être au format HH:MM." });
+      return;
+    }
+    if (shiftEndRaw && !isValidHHMM(shiftEndRaw)) {
+      res.status(400).json({ error: "L'heure de fin personnalisée doit être au format HH:MM." });
+      return;
+    }
+
+    let graceValue: number | null = null;
+    if (graceRaw !== null && graceRaw !== undefined && graceRaw !== '') {
+      const parsedGrace = Number(graceRaw);
+      if (!Number.isFinite(parsedGrace) || parsedGrace < 0 || parsedGrace > 180) {
+        res.status(400).json({ error: 'La tolérance personnalisée doit être comprise entre 0 et 180 minutes.' });
+        return;
+      }
+      graceValue = Math.round(parsedGrace);
     }
 
     const code = generateUniqueEmployeeCode();
@@ -1418,10 +2110,19 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
 
     const info = db
       .prepare(
-        `INSERT INTO employees (first_name, last_name, job_title, code, is_active, created_at)
-         VALUES (?, ?, ?, ?, 1, ?)`
+        `INSERT INTO employees (first_name, last_name, job_title, code, is_active, shift_start, shift_end, grace_minutes, created_at)
+         VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)`
       )
-      .run(firstName, lastName, jobTitle, code, now);
+      .run(
+        firstName,
+        lastName,
+        jobTitle,
+        code,
+        shiftStartRaw || null,
+        shiftEndRaw || null,
+        graceValue,
+        now
+      );
 
     const created = db.prepare('SELECT * FROM employees WHERE id = ?').get(info.lastInsertRowid) as EmployeeRow;
     res.status(201).json({ employee: created });
@@ -1450,9 +2151,46 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
       return;
     }
 
+    let shiftStart = existing.shift_start;
+    if (req.body?.shift_start !== undefined) {
+      const raw = typeof req.body.shift_start === 'string' ? req.body.shift_start.trim() : '';
+      if (raw && !isValidHHMM(raw)) {
+        res.status(400).json({ error: "L'heure d'arrivée personnalisée doit être au format HH:MM." });
+        return;
+      }
+      shiftStart = raw || null;
+    }
+
+    let shiftEnd = existing.shift_end;
+    if (req.body?.shift_end !== undefined) {
+      const raw = typeof req.body.shift_end === 'string' ? req.body.shift_end.trim() : '';
+      if (raw && !isValidHHMM(raw)) {
+        res.status(400).json({ error: "L'heure de fin personnalisée doit être au format HH:MM." });
+        return;
+      }
+      shiftEnd = raw || null;
+    }
+
+    let graceMinutes = existing.grace_minutes;
+    if (req.body?.grace_minutes !== undefined) {
+      const raw = req.body.grace_minutes;
+      if (raw === null || raw === '') {
+        graceMinutes = null;
+      } else {
+        const parsedGrace = Number(raw);
+        if (!Number.isFinite(parsedGrace) || parsedGrace < 0 || parsedGrace > 180) {
+          res.status(400).json({ error: 'La tolérance personnalisée doit être comprise entre 0 et 180 minutes.' });
+          return;
+        }
+        graceMinutes = Math.round(parsedGrace);
+      }
+    }
+
     db.prepare(
-      `UPDATE employees SET first_name = ?, last_name = ?, job_title = ?, is_active = ? WHERE id = ?`
-    ).run(firstName, lastName, jobTitle, isActive, id);
+      `UPDATE employees
+       SET first_name = ?, last_name = ?, job_title = ?, is_active = ?, shift_start = ?, shift_end = ?, grace_minutes = ?
+       WHERE id = ?`
+    ).run(firstName, lastName, jobTitle, isActive, shiftStart, shiftEnd, graceMinutes, id);
 
     const updated = db.prepare('SELECT * FROM employees WHERE id = ?').get(id) as EmployeeRow;
     res.json({ employee: updated });
@@ -1711,12 +2449,20 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
       logoDataUrl = req.body.logo_data_url;
     }
 
+    const autoCloseTime = typeof req.body?.auto_close_time === 'string'
+      ? req.body.auto_close_time.trim()
+      : current.auto_close_time || '23:59';
+
     if (!companyName) {
       res.status(400).json({ error: "Le nom de l'entreprise est obligatoire." });
       return;
     }
-    if (!/^\d{2}:\d{2}$/.test(officialStartTime)) {
+    if (!isValidHHMM(officialStartTime)) {
       res.status(400).json({ error: "L'heure officielle doit être au format HH:MM (ex: 09:00)." });
+      return;
+    }
+    if (!isValidHHMM(autoCloseTime)) {
+      res.status(400).json({ error: "L'heure de clôture automatique doit être au format HH:MM (ex: 23:59)." });
       return;
     }
     if (!Number.isFinite(graceMinutesRaw) || graceMinutesRaw < 0 || graceMinutesRaw > 180) {
@@ -1728,7 +2474,7 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
     const retentionDays = Math.round(retentionRaw);
     db.prepare(
       `UPDATE settings
-       SET company_name = ?, logo_data_url = ?, official_start_time = ?, grace_minutes = ?, allowed_network_prefix = ?, working_days = ?, public_holidays = ?, photo_requirement = ?, photo_retention_days = ?, updated_at = ?
+       SET company_name = ?, logo_data_url = ?, official_start_time = ?, grace_minutes = ?, allowed_network_prefix = ?, working_days = ?, public_holidays = ?, photo_requirement = ?, photo_retention_days = ?, auto_close_time = ?, updated_at = ?
        WHERE id = 1`
     ).run(
       companyName,
@@ -1740,10 +2486,12 @@ export function createApiRouter(desktopHooks?: DesktopHooks): Router {
       JSON.stringify(publicHolidaysList),
       photoRequirement,
       retentionDays,
+      autoCloseTime,
       now
     );
 
     cleanupOldPhotos(retentionDays);
+    runAutoCloseMissingCheckouts();
 
     const updated = getSettings();
     res.json({

@@ -16,16 +16,25 @@ export interface EmployeeProfile {
   first_name: string;
   last_name: string;
   job_title: string;
+  shift_start?: string | null;
+  shift_end?: string | null;
+  grace_minutes?: number | null;
 }
 
 export interface EmployeeFull extends EmployeeProfile {
   code: string;
   is_active: number;
+  shift_start: string | null;
+  shift_end: string | null;
+  grace_minutes: number | null;
   created_at: string;
 }
 
 export interface EmployeeListOption extends EmployeeProfile {
   is_active: number;
+  shift_start?: string | null;
+  shift_end?: string | null;
+  grace_minutes?: number | null;
 }
 
 export interface AttendanceRecord {
@@ -41,7 +50,69 @@ export interface AttendanceRecord {
   is_late: number;
   late_minutes: number;
   worked_minutes: number;
+  checkout_missing?: number;
+  auto_closed_at?: string | null;
+  is_corrected?: number;
+  last_correction_reason?: string | null;
   created_at: string;
+}
+
+export interface MissingYesterdayInfo {
+  work_date: string;
+  punch_type: 'checkin' | 'checkout';
+  checkin_time: string | null;
+  request_status: 'pending' | 'approved' | 'rejected' | null;
+}
+
+export interface CorrectionRequestItem {
+  id: number;
+  employee_id: number;
+  work_date: string;
+  punch_type: 'checkin' | 'checkout';
+  requested_time: string;
+  reason: string;
+  status: 'pending' | 'approved' | 'rejected';
+  reviewed_by_admin_id: number | null;
+  reviewed_by_username: string | null;
+  review_note: string | null;
+  reviewed_at: string | null;
+  created_at: string;
+  first_name?: string;
+  last_name?: string;
+  job_title?: string;
+  attendance_id?: number | null;
+  current_checkin_time?: string | null;
+  current_checkout_time?: string | null;
+  current_checkout_missing?: number | null;
+}
+
+export type CorrectionLogActionType =
+  | 'manual_add'
+  | 'manual_edit'
+  | 'request_approved'
+  | 'request_rejected'
+  | 'auto_close';
+
+export interface CorrectionLogItem {
+  id: number;
+  attendance_id: number | null;
+  employee_id: number;
+  employee_name: string;
+  work_date: string;
+  action_type: CorrectionLogActionType;
+  actor_admin_id: number | null;
+  actor_username: string;
+  old_value: string;
+  new_value: string;
+  reason: string;
+  created_at: string;
+}
+
+export interface AdminAlertsSummary {
+  today_unreported: number;
+  missing_checkouts_count: number;
+  pending_requests: number;
+  total_alerts: number;
 }
 
 export interface AdminUser {
@@ -52,17 +123,30 @@ export interface AdminUser {
   created_at?: string;
 }
 
+export type TodayEmployeeStatus =
+  | 'present'
+  | 'late'
+  | 'unreported'
+  | 'missing_checkout'
+  | 'absent';
+
 export interface TodayEmployeeRow {
   attendance_id: number | null;
   employee_id: number;
   first_name: string;
   last_name: string;
   job_title: string;
-  status: 'present' | 'late' | 'absent';
+  status: TodayEmployeeStatus;
   checkin_time: string | null;
   checkout_time: string | null;
   late_minutes: number;
   worked_minutes: number;
+  checkout_missing?: boolean;
+  is_corrected?: boolean;
+  last_correction_reason?: string | null;
+  shift_start?: string;
+  shift_end?: string | null;
+  grace_minutes?: number;
   checkin_ip: string | null;
   checkout_ip: string | null;
   has_checkin_photo: boolean;
@@ -78,8 +162,12 @@ export interface TodayDashboardResponse {
     present_total: number;
     on_time: number;
     late: number;
+    unreported: number;
+    missing_checkout: number;
     absent: number;
+    pending_requests: number;
   };
+  alerts?: AdminAlertsSummary;
   employees: TodayEmployeeRow[];
 }
 
@@ -93,6 +181,9 @@ export interface MonthlyEmployeeRow {
   days_present: number;
   days_absent: number;
   days_late: number;
+  missing_checkouts: number;
+  missing_punches: number;
+  corrected_punches: number;
   total_late_minutes: number;
   total_worked_minutes: number;
   attendance_rate: number;
@@ -116,6 +207,10 @@ export interface AdminAttendanceRow {
   is_late: number;
   late_minutes: number;
   worked_minutes: number;
+  checkout_missing?: number;
+  auto_closed_at?: string | null;
+  is_corrected?: number;
+  last_correction_reason?: string | null;
 }
 
 export type CalendarCellStatus =
@@ -220,6 +315,7 @@ export interface AppSettings {
   public_holidays: PublicHolidayEntry[];
   photo_requirement: PhotoRequirement;
   photo_retention_days: number;
+  auto_close_time: string;
   updated_at: string;
 }
 
