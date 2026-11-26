@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Camera, Download, X } from 'lucide-react';
-import { downloadAuthenticatedFile, formatMinutesToHours } from '../api';
+import { downloadAuthenticatedFile, fetchProtectedBlob, formatMinutesToHours } from '../api';
 
 export interface PhotoDetailModalPayload {
   employeeName: string;
@@ -103,16 +103,7 @@ export function useLazyProtectedPhotoUrl(
     setLoading(true);
     setFailed(false);
 
-    fetch(photoUrl, {
-      credentials: 'same-origin',
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    })
-      .then((res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.blob();
-      })
+    fetchProtectedBlob(photoUrl, token)
       .then((blob) => {
         if (cancelled) return;
         const createdUrl = URL.createObjectURL(blob);

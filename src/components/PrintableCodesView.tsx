@@ -1,5 +1,6 @@
-import React from 'react';
-import { ArrowLeft, Printer } from 'lucide-react';
+import React, { useRef, useState } from 'react';
+import { ArrowLeft, FileDown, Printer } from 'lucide-react';
+import { buildStandalonePrintHtml } from '../api';
 import type { EmployeeFull } from '../types';
 
 interface PrintableCodesViewProps {
@@ -13,12 +14,28 @@ export const PrintableCodesView: React.FC<PrintableCodesViewProps> = ({
   employees,
   onClose,
 }) => {
+  const sheetRef = useRef<HTMLDivElement | null>(null);
+  const [exportingPdf, setExportingPdf] = useState(false);
   const activeEmployees = employees.filter((e) => e.is_active === 1);
   const todayFormatted = new Date().toLocaleDateString('fr-FR', {
     day: '2-digit',
     month: 'long',
     year: 'numeric',
   });
+
+  const handleExportPdf = async () => {
+    if (!window.electronAPI?.printToPDF || !sheetRef.current || exportingPdf) return;
+    setExportingPdf(true);
+    try {
+      const html = buildStandalonePrintHtml(
+        sheetRef.current.outerHTML,
+        `${companyName} - Codes personnels`
+      );
+      await window.electronAPI.printToPDF(html, 'codes-employes.pdf');
+    } finally {
+      setExportingPdf(false);
+    }
+  };
 
   return (
     <div className="min-h-screen bg-white text-slate-900 p-6 sm:p-10">
@@ -33,18 +50,31 @@ export const PrintableCodesView: React.FC<PrintableCodesViewProps> = ({
           Retour aux employés
         </button>
 
-        <button
-          type="button"
-          onClick={() => window.print()}
-          className="min-h-[44px] inline-flex items-center gap-2 rounded-xl bg-blue-900 px-5 py-2.5 text-sm font-bold text-white hover:bg-blue-950"
-        >
-          <Printer className="w-4 h-4" />
-          Imprimer la feuille des codes
-        </button>
+        <div className="flex flex-wrap items-center gap-2.5">
+          {window.electronAPI?.isElectron && (
+            <button
+              type="button"
+              onClick={() => void handleExportPdf()}
+              disabled={exportingPdf}
+              className="min-h-[44px] inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-bold text-slate-800 hover:bg-slate-100 disabled:opacity-50"
+            >
+              <FileDown className="w-4 h-4" />
+              {exportingPdf ? 'Export PDF...' : 'Enregistrer en PDF'}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => window.print()}
+            className="min-h-[44px] inline-flex items-center gap-2 rounded-xl bg-blue-900 px-5 py-2.5 text-sm font-bold text-white hover:bg-blue-950"
+          >
+            <Printer className="w-4 h-4" />
+            Imprimer la feuille des codes
+          </button>
+        </div>
       </div>
 
       {/* Printable Sheet */}
-      <div className="max-w-4xl mx-auto">
+      <div ref={sheetRef} className="max-w-4xl mx-auto">
         <div className="mb-6 border-b-2 border-slate-900 pb-4 flex items-baseline justify-between gap-4">
           <div>
             <h1 className="text-2xl font-extrabold text-slate-900">

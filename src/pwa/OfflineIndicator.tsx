@@ -19,7 +19,11 @@ export const OfflineIndicator: React.FC = () => {
     };
   }, []);
 
-  if (isOnline) return null;
+  const isOfflineDesktop =
+    typeof window !== 'undefined' &&
+    (Boolean(window.electronAPI?.isElectron) || window.location.protocol === 'file:');
+
+  if (isOnline || isOfflineDesktop) return null;
 
   return (
     <div className="fixed bottom-4 left-4 right-4 sm:left-auto sm:right-4 sm:max-w-sm z-50 flex items-center gap-3 rounded-xl bg-amber-600 px-4 py-3 text-sm font-semibold text-white shadow-lg">

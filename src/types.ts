@@ -64,6 +64,8 @@ export interface MissingYesterdayInfo {
   request_status: 'pending' | 'approved' | 'rejected' | null;
 }
 
+export type CorrectionRequestStatus = 'pending' | 'approved' | 'rejected';
+
 export interface CorrectionRequestItem {
   id: number;
   employee_id: number;
@@ -71,7 +73,7 @@ export interface CorrectionRequestItem {
   punch_type: 'checkin' | 'checkout';
   requested_time: string;
   reason: string;
-  status: 'pending' | 'approved' | 'rejected';
+  status: CorrectionRequestStatus;
   reviewed_by_admin_id: number | null;
   reviewed_by_username: string | null;
   review_note: string | null;
@@ -342,3 +344,24 @@ export interface DesktopSettingsResponse {
   open_at_login: boolean;
   start_minimized: boolean;
 }
+
+export interface ElectronPrintResult {
+  ok: boolean;
+  canceled?: boolean;
+  filePath?: string;
+  error?: string;
+}
+
+export interface ElectronBridgeAPI {
+  isElectron: boolean;
+  printToPDF: (html: string, fileName?: string) => Promise<ElectronPrintResult>;
+  getDataPath: () => Promise<string>;
+  openDataFolder: () => Promise<boolean>;
+}
+
+declare global {
+  interface Window {
+    electronAPI?: ElectronBridgeAPI;
+  }
+}
+
